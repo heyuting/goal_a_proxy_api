@@ -1,14 +1,60 @@
 from flask import Flask, request, jsonify
 import subprocess
+import io
 import os
 import json
 import time
+import paramiko
+
 
 app = Flask(__name__)
 
 GRACE_USER = "your_grace_username"
 JOB_STATUS_CACHE = {}  # In production, use Redis or database
 
+@app.route("/api/test-ssh", methods=["GET"])
+def test_ssh():
+    """Test endpoint to verify SSH connection"""
+    try:
+        # Create SSH connection (same logic you'll use for job submission)
+        ssh = paramiko.SSHClient()
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        
+        # Get credentials from environment
+        hostname = os.getenv("GRACE_HOSTNAME", "grace.hpc.yale.edu")
+        username = os.getenv("GRACE_USERNAME", "yhs5")
+        private_key_str = os.getenv("SSH_PRIVATE_KEY")
+        
+        if not private_key_str:
+            return jsonify({
+                "success": False,
+                "error": "SSH_PRIVATE_KEY environment variable not set"
+            }), 500
+        
+        # Create private key object from string
+        private_key = paramiko.RSAKey.from_private_key(io.StringIO(private_key_str))
+        
+        # Connect to Grace
+        ssh.connect(hostname=hostname, username=username, pkey=private_key)
+        
+        # Run a simple test command
+        stdin, stdout, stderr = ssh.exec_command("whoami && hostname && pwd")
+        result = stdout.read().decode().strip()
+        
+        ssh.close()
+        
+        return jsonify({
+            "success": True,
+            "message": "SSH connection successful",
+            "test_output": result
+        })
+        
+    except Exception as e:
+        return jsonify({
+            "success": False,
+            "error": str(e)
+        }), 500
+        
 @app.route('/api/run-job', methods=['POST'])
 def run_job():
     try:
