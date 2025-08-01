@@ -1,81 +1,104 @@
-
 from flask import Flask, request, jsonify
-import paramiko
+import subprocess
 import os
-import io
-import time
 import json
 
 app = Flask(__name__)
 
-GRACE_USER = os.getenv("GRACE_USER")
-GRACE_HOST = os.getenv("GRACE_HOST")
-SSH_KEY = os.getenv("SSH_PRIVATE_KEY").replace("\\n", "\n")
+GRACE_USER = "your_grace_username"
+JOB_STATUS_CACHE = {}  # In production, use Redis or database
 
-
-def ssh_connect():
-    k = paramiko.Ed25519Key.from_private_key(io.StringIO(SSH_KEY))
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(GRACE_HOST, username=GRACE_USER, pkey=k)
-    return client
-
-
-@app.route('/run-job', methods=['POST'])
+@app.route('/api/run-job', methods=['POST'])
 def run_job():
-    data = request.json
-    model = data['model']  # ats, drn, or scepter
-    params = data['parameters']
+    try:
+        data = request.json
+        model = data.get('model')
+        parameters = data.get('parameters')
+        user_id = data.get('user_id', 'anonymous')
 
-    timestamp = str(int(time.time()))
-    job_folder = f"/scratch/{GRACE_USER}/goal_a_jobs/{model}-{timestamp}"
-    params_file = f"{job_folder}/params.json"
+        # Create job folder with parameters
+        job_folder = f"/tmp/job_{user_id}_{model}_{int(time.time())}"
+        os.makedirs(job_folder, exist_ok=True)
 
-    client = ssh_connect()
-    sftp = client.open_sftp()
-    client.exec_command(f"mkdir -p {job_folder}")
+        # Write parameters to job folder
+        with open(f"{job_folder}/parameters.json", 'w') as f:
+            json.dump(parameters, f)
 
-    with sftp.file(params_file, 'w') as f:
-        f.write(json.dumps(params))
-    sftp.close()
+        # Submit to SLURM using sbatch
+        cmd = f"sbatch /home/{GRACE_USER}/goal_a_scripts/run_{model}_job.sh {job_folder}"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
-    cmd = f"sbatch /home/{GRACE_USER}/goal_a_scripts/run_{model}_job.sh {job_folder}"
-    stdin, stdout, stderr = client.exec_command(cmd)
-    job_output = stdout.read().decode()
-    job_id = job_output.strip().split()[-1]
+        if result.returncode == 0:
+            # Extract job ID from sbatch output
+            job_id = result.stdout.strip().split()[-1]
 
-    client.close()
+            # Cache job info
+            JOB_STATUS_CACHE[job_id] = {
+                'model': model,
+                'parameters': parameters,
+                'user_id': user_id,
+                'job_folder': job_folder,
+                'status': 'submitted'
+            }
 
-    return jsonify({"job_id": job_id, "job_folder": job_folder})
+            return jsonify({
+                'job_id': job_id,
+                'status': 'submitted',
+                'message': 'Job submitted successfully'
+            })
+        else:
+            return jsonify({
+                'error': f'Failed to submit job: {result.stderr}'
+            }), 500
 
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-@app.route('/check-job-status', methods=['POST'])
-def check_job_status():
-    job_id = request.json['job_id']
-    job_folder = request.json['job_folder']
+@app.route('/api/check-job-status/<job_id>', methods=['GET'])
+def check_job_status(job_id):
+    try:
+        # Check SLURM job status
+        cmd = f"squeue -j {job_id} --format='%T' --noheader"
+        result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
-    client = ssh_connect()
-    stdin, stdout, stderr = client.exec_command(f"squeue -j {job_id}")
-    output = stdout.read().decode()
+        if result.returncode == 0 and result.stdout.strip():
+            slurm_status = result.stdout.strip()
 
-    if job_id in output:
-        status = "running"
-        result = None
-    else:
-        sftp = client.open_sftp()
-        try:
-            with sftp.file(f"{job_folder}/output.json", 'r') as f:
-                result = json.loads(f.read().decode())
-            status = "completed"
-        except IOError:
-            status = "error"
-            result = None
-        sftp.close()
+            # Map SLURM status to our status
+            status_map = {
+                'PENDING': 'pending',
+                'RUNNING': 'running',
+                'COMPLETED': 'completed',
+                'FAILED': 'failed',
+                'CANCELLED': 'failed'
+            }
+            status = status_map.get(slurm_status, 'unknown')
+        else:
+            # Job not in queue, check if completed
+            status = 'completed'  # or 'failed' based on exit code
 
-    client.close()
-    return jsonify({"status": status, "result": result})
+        # Get job logs if available
+        logs = []
+        if job_id in JOB_STATUS_CACHE:
+            job_folder = JOB_STATUS_CACHE[job_id]['job_folder']
+            log_file = f"{job_folder}/slurm-{job_id}.out"
+            if os.path.exists(log_file):
+                with open(log_file, 'r') as f:
+                    logs = f.readlines()[-20:]  # Last 20 lines
 
+        return jsonify({
+            'job_id': job_id,
+            'status': status,
+            'logs': logs,
+            'error': None
+        })
+
+    except Exception as e:
+        return jsonify({
+            'job_id': job_id,
+            'status': 'unknown',
+            'error': str(e)
+        }), 500
 
 if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 10000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(debug=True)
