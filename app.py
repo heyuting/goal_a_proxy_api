@@ -17,8 +17,8 @@ def get_ssh_connection():
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-    hostname = os.getenv("GRACE_HOSTNAME")
-    username = os.getenv("GRACE_USERNAME")
+    hostname = os.getenv("GRACE_HOST")
+    username = os.getenv("GRACE_USER")
     private_key_str = os.getenv("SSH_PRIVATE_KEY")
 
     if not private_key_str:
