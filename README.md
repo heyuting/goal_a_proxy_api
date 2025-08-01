@@ -30,5 +30,5 @@ Check the job status. Payload:
 Deploy to Render using this repo. Set these environment variables in Render:
 
 - `GRACE_USER`
-- `GRACE_HOST` (e.g., grace.hpc.yale.edu)
+- `GRACE_HOST` (e.g., grace.ycrc.yale.edu)
 - `SSH_PRIVATE_KEY` (private key with \n newlines)
