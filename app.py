@@ -1,12 +1,29 @@
+from dotenv import load_dotenv
 from flask import Flask, request, jsonify
+from flask_cors import CORS, cross_origin
 import subprocess
 import io
 import os
 import json
 import time
 import paramiko
+import re
+import logging
+
+load_dotenv()  # Load variables from .env file
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.DEBUG)
+# Configure CORS origins from environment variable or use defaults
+cors_origins = os.getenv(
+    "CORS_ORIGINS", "https://venerable-speculoos-b273da.netlify.app/"
+).split(",")
+app.logger.debug(f"CORS origins configured: {cors_origins}")
+CORS(
+    app,
+    origins=cors_origins,
+    supports_credentials=True,
+)
 
 GRACE_USER = "yhs5"
 JOB_STATUS_CACHE = {}  # In production, use Redis or database
@@ -44,53 +61,33 @@ def get_ssh_connection():
             except:
                 raise Exception("Could not parse SSH private key. Unsupported format.")
 
-    ssh.connect(hostname=hostname, username=username, pkey=private_key)
+    ssh.connect(
+        hostname=hostname,
+        username=username,
+        pkey=private_key,
+        timeout=60,
+        auth_timeout=60,
+    )
     return ssh
 
 
-@app.route("/api/test-ssh", methods=["GET"])
-def test_ssh():
-    """Test endpoint to verify SSH connection"""
-    try:
-        # Use the helper function for consistency
-        ssh = get_ssh_connection()
-
-        # Run a simple test command
-        stdin, stdout, stderr = ssh.exec_command(
-            "whoami && hostname && pwd && ls -la /home/yhs5/project/goal_a_scripts/"
-        )
-        result = stdout.read().decode().strip()
-        error = stderr.read().decode().strip()
-
-        ssh.close()
-
-        return jsonify(
-            {
-                "success": True,
-                "message": "SSH connection successful",
-                "test_output": result,
-                "error_output": error if error else None,
-            }
-        )
-
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
 @app.route("/api/run-job", methods=["POST"])
+@cross_origin(origins="https://venerable-speculoos-b273da.netlify.app")
 def run_job():
+    app.logger.debug("Received request to run job")
     try:
         data = request.json
         model = data.get("model")
         parameters = data.get("parameters")
         user_id = data.get("user_id", "anonymous")
+        user_id_clean = re.sub(r"\W+", "", user_id)
 
         if model != "drn":
             return jsonify({"error": "Only DRN model supported currently"}), 400
 
         # Create unique job folder on Grace server (via SSH)
         timestamp = int(time.time())
-        job_folder = f"/tmp/drn_job_{user_id}_{timestamp}"
+        job_folder = f"/home/yhs5/project/DRN/tmp_drn_job_{user_id_clean}_{timestamp}"
 
         # Connect to Grace via SSH
         ssh = get_ssh_connection()
@@ -114,7 +111,7 @@ def run_job():
 
         # Submit to SLURM using sbatch via SSH
         sbatch_cmd = (
-            f"sbatch /home/{GRACE_USER}/project/goal_a_scripts/run_drn_job.sh {job_folder}"
+            f"sbatch /home/{GRACE_USER}/project/DRN/run_drn_job.sh {job_folder}"
         )
         stdin, stdout, stderr = ssh.exec_command(sbatch_cmd)
 
@@ -158,6 +155,7 @@ def run_job():
 
 
 @app.route("/api/check-job-status/<job_id>", methods=["GET"])
+@cross_origin(origins="https://venerable-speculoos-b273da.netlify.app")
 def check_job_status(job_id):
     try:
         # Connect to Grace via SSH
@@ -166,8 +164,9 @@ def check_job_status(job_id):
         # Check SLURM job status via SSH
         squeue_cmd = f"squeue -j {job_id} --format='%T' --noheader"
         stdin, stdout, stderr = ssh.exec_command(squeue_cmd)
-
-        slurm_status = stdout.read().decode().strip()
+        slurm_status_raw = stdout.read().decode().strip()
+        slurm_status = slurm_status_raw.split("\n")[0]  # Take only first line
+        app.logger.debug(f"SLURM status for {job_id}: {slurm_status}")
 
         if slurm_status:
             # Map SLURM status to our status
@@ -181,21 +180,21 @@ def check_job_status(job_id):
             }
             status = status_map.get(slurm_status, "unknown")
         else:
-            # Job not in queue, check if output file exists
-            check_cmd = f"ls /home/{GRACE_USER}/drn_{job_id}.out 2>/dev/null && echo 'exists' || echo 'not_found'"
+            # Job not in queue, check if output file exists to determine completion
+            check_cmd = f"test -f /home/{GRACE_USER}/project/DRN/tmp_output/drn_{job_id}_1.out && echo 'completed' || echo 'failed'"
             stdin, stdout, stderr = ssh.exec_command(check_cmd)
             output_check = stdout.read().decode().strip()
-            status = "completed" if output_check == "exists" else "failed"
-
+            status = output_check  # Will be either 'completed' or 'failed'
+            app.logger.debug(f"Status for {job_id}: {status}")
         # Get job logs if available
         logs = []
         if status in ["completed", "failed"]:
             # Try to get job output
-            log_cmd = f"tail -20 /home/{GRACE_USER}/drn_{job_id}.out 2>/dev/null || echo 'No output file found'"
+            log_cmd = f"cat /home/{GRACE_USER}/project/DRN/tmp_output/drn_{job_id}_1.out 2>/dev/null || echo 'No output file found'"
             stdin, stdout, stderr = ssh.exec_command(log_cmd)
             log_content = stdout.read().decode()
             logs = log_content.split("\n") if log_content else ["No logs available"]
-
+            app.logger.debug(f"Logs for {job_id}: {logs}")
         ssh.close()
 
         return jsonify(
@@ -209,6 +208,7 @@ def check_job_status(job_id):
         )
 
     except Exception as e:
+        app.logger.error(f"Error in check_job_status for {job_id}: {str(e)}")
         return (
             jsonify(
                 {
@@ -222,4 +222,4 @@ def check_job_status(job_id):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=8000, debug=True)
