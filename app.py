@@ -15,18 +15,43 @@ load_dotenv()  # Load variables from .env file
 app = Flask(__name__)
 logging.basicConfig(level=logging.DEBUG)
 # Configure CORS origins from environment variable or use defaults
-cors_origins = os.getenv(
-    "CORS_ORIGINS", "https://venerable-speculoos-b273da.netlify.app/"
-).split(",")
+# Read CORS origins from env and strip whitespace/trailing slashes
+# Allowed origins from .env
+cors_origins = [
+    origin.rstrip("/")
+    for origin in os.getenv(
+        "CORS_ORIGINS",
+        "http://localhost:5173,https://venerable-speculoos-b273da.netlify.app",
+    ).split(",")
+]
 app.logger.debug(f"CORS origins configured: {cors_origins}")
+
+
+# Dynamic origin function for credentials support
+def get_cors_origin():
+    origin = request.headers.get("Origin")
+    if origin in cors_origins:
+        return origin
+    return None
+
+
+# Apply CORS globally
 CORS(
     app,
-    origins=cors_origins,
+    origins=["https://venerable-speculoos-b273da.netlify.app", "http://localhost:5173"],
+    allow_headers=["Content-Type", "ngrok-skip-browser-warning"],
+    methods=["GET", "POST", "OPTIONS"],
     supports_credentials=True,
 )
 
 GRACE_USER = "yhs5"
 JOB_STATUS_CACHE = {}  # In production, use Redis or database
+
+
+@app.before_request
+def handle_options():
+    if request.method == "OPTIONS":
+        return "", 200
 
 
 def get_ssh_connection():
@@ -72,18 +97,111 @@ def get_ssh_connection():
 
 
 @app.route("/api/run-job", methods=["POST"])
-@cross_origin(origins="https://venerable-speculoos-b273da.netlify.app")
 def run_job():
     app.logger.debug("Received request to run job")
     try:
-        data = request.json
-        model = data.get("model")
-        parameters = data.get("parameters")
-        user_id = data.get("user_id", "anonymous")
+        # Accept both legacy shape { model, parameters, user_id }
+        # and new shape { data: { model_type, locations, numStart, yearRun, timeStep, ... }, user_id? }
+        payload = request.get_json(silent=True) or {}
+        data_block = (
+            payload.get("data") if isinstance(payload.get("data"), dict) else None
+        )
+
+        # Model
+        model_raw = None
+        if data_block:
+            model_raw = data_block.get("model_type") or payload.get("model")
+        else:
+            model_raw = payload.get("model") or payload.get("model_type")
+        model = (model_raw or "drn").lower()
+
+        # Parameters
+        parameters = None
+        if "parameters" in payload and isinstance(payload.get("parameters"), dict):
+            parameters = payload.get("parameters")
+        elif data_block:
+            # Build parameters dict from new shape
+            parameters = {
+                "locations": data_block.get("locations", []),
+                "numStart": data_block.get("numStart"),
+                "yearRun": data_block.get("yearRun"),
+                "timeStep": data_block.get("timeStep"),
+            }
+            # Optional arrays/fields (pass-through if provided)
+            if "riverInputRates" in data_block:
+                parameters["riverInputRates"] = data_block.get("riverInputRates")
+            if "extra" in data_block and isinstance(data_block["extra"], dict):
+                parameters["extra"] = data_block["extra"]
+
+            # Normalize per-location key variants (e.g., "ewRiverinput rate" -> "ewRiverInputRate")
+            if isinstance(parameters.get("locations"), list):
+                normalized_locations = []
+                for loc in parameters["locations"]:
+                    if isinstance(loc, dict):
+                        new_loc = dict(loc)
+                        # Handle common typos/variants
+                        for k in list(new_loc.keys()):
+                            if k.strip().lower() in [
+                                "ewriverinput rate",
+                                "ewriverinputrate",
+                                "ew_river_input_rate",
+                            ]:
+                                new_loc["ewRiverInputRate"] = new_loc.get(k)
+                                del new_loc[k]
+                            if k.strip() == "ewRiverInput":
+                                new_loc["ewRiverInputRate"] = new_loc.get(k)
+                                del new_loc[k]
+                        normalized_locations.append(new_loc)
+                    else:
+                        normalized_locations.append(loc)
+                parameters["locations"] = normalized_locations
+        elif any(
+            key in payload for key in ["locations", "numStart", "yearRun", "timeStep"]
+        ):
+            # Build parameters from flat root-level shape
+            parameters = {
+                "locations": payload.get("locations", []),
+                "numStart": payload.get("numStart"),
+                "yearRun": payload.get("yearRun"),
+                "timeStep": payload.get("timeStep"),
+            }
+            # Normalize per-location key variants
+            if isinstance(parameters.get("locations"), list):
+                normalized_locations = []
+                for loc in parameters["locations"]:
+                    if isinstance(loc, dict):
+                        new_loc = dict(loc)
+                        for k in list(new_loc.keys()):
+                            if k.strip().lower() in [
+                                "ewriverinput rate",
+                                "ewriverinputrate",
+                                "ew_river_input_rate",
+                            ]:
+                                new_loc["ewRiverInputRate"] = new_loc.get(k)
+                                del new_loc[k]
+                            if k.strip() == "ewRiverInput":
+                                new_loc["ewRiverInputRate"] = new_loc.get(k)
+                                del new_loc[k]
+                        normalized_locations.append(new_loc)
+                    else:
+                        normalized_locations.append(loc)
+                parameters["locations"] = normalized_locations
+        else:
+            parameters = None
+
+        # User id
+        user_id = (
+            payload.get("user_id")
+            or (data_block.get("user_id") if data_block else None)
+            or "anonymous"
+        )
         user_id_clean = re.sub(r"\W+", "", user_id)
 
+        # Basic validation
         if model != "drn":
             return jsonify({"error": "Only DRN model supported currently"}), 400
+        if not isinstance(parameters, dict):
+            return jsonify({"error": "Missing or invalid parameters"}), 400
 
         # Create unique job folder on Grace server (via SSH)
         timestamp = int(time.time())
@@ -155,7 +273,6 @@ def run_job():
 
 
 @app.route("/api/check-job-status/<job_id>", methods=["GET"])
-@cross_origin(origins="https://venerable-speculoos-b273da.netlify.app")
 def check_job_status(job_id):
     try:
         # Connect to Grace via SSH
@@ -222,4 +339,4 @@ def check_job_status(job_id):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000, debug=True)
+    app.run(host="0.0.0.0", port=8080, debug=True)
