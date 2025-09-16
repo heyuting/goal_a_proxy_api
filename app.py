@@ -48,12 +48,6 @@ GRACE_USER = "yhs5"
 JOB_STATUS_CACHE = {}  # In production, use Redis or database
 
 
-@app.before_request
-def handle_options():
-    if request.method == "OPTIONS":
-        return "", 200
-
-
 def get_ssh_connection():
     """Create SSH connection to Grace server"""
     ssh = paramiko.SSHClient()
@@ -339,4 +333,4 @@ def check_job_status(job_id):
 
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080, debug=True)
+    app.run(host="0.0.0.0", port=8000, debug=True)
