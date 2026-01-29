@@ -76,6 +76,87 @@ Check the status of a submitted job.
 - `failed` - Job failed or was cancelled
 - `unknown` - Status could not be determined
 
+### POST /api/drn/site-selection
+
+Submit a DRN site selection job (Step 1) to identify watersheds and river networks.
+
+**Request Body:**
+
+```json
+{
+  "locations": [
+    { "lat": 37.0, "lon": -78.0 },
+    { "lat": 36.5, "lon": -77.5 }
+  ]
+}
+```
+
+**Response:**
+
+```json
+{
+  "job_id": "drn_site_1234567890_1234",
+  "grace_job_id": "12345",
+  "status": "submitted",
+  "message": "Site selection job submitted successfully. Job ID: drn_site_1234567890_1234"
+}
+```
+
+### GET /api/drn/site-selection/<job_id>/status
+
+Check the status of a site selection job.
+
+**Response:**
+
+```json
+{
+  "job_id": "drn_site_1234567890_1234",
+  "grace_job_id": "12345",
+  "status": "running",
+  "submitted_at": 1234567890.123
+}
+```
+
+### GET /api/drn/site-selection/<job_id>/results
+
+Get the results of a completed site selection job (returns GeoJSON shapefiles).
+
+**Response:**
+
+```json
+{
+  "job_id": "drn_site_1234567890_1234",
+  "status": "completed",
+  "shapefiles": {
+    "sf_ws_all": {
+      /* GeoJSON watershed polygons */
+    },
+    "sf_river_ode": {
+      /* GeoJSON downstream rivers */
+    },
+    "sf_river_trib": {
+      /* GeoJSON tributaries */
+    },
+    "sf_river_middle": {
+      /* GeoJSON centroids */
+    },
+    "sf_river_rock": {
+      /* GeoJSON selected segments (optional) */
+    }
+  },
+  "summary_csv": "COMID,outlet,Length,ws_area,..."
+}
+```
+
+If job is still processing, returns `202 Accepted` with:
+
+```json
+{
+  "status": "processing",
+  "message": "Job is still running. Please check back later."
+}
+```
+
 ## Installation
 
 1. Clone the repository:
@@ -148,4 +229,3 @@ ngrok http http://localhost:8000
 ```
 
 5. Note the ngrok URL (e.g., `https://abc123.ngrok.io`) and use this as your API endpoint
-

@@ -15,9 +15,6 @@ load_dotenv()  # Load variables from .env file
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.DEBUG)
-
-# Suppress paramiko DEBUG messages about dead connections (they're usually harmless)
-logging.getLogger("paramiko.transport").setLevel(logging.WARNING)
 # Configure CORS origins from environment variable or use defaults
 # Read CORS origins from env and strip whitespace/trailing slashes
 cors_origins_env = os.getenv(
@@ -73,7 +70,7 @@ CORS(
     max_age=3600,  # Cache preflight requests for 1 hour
 )
 
-GRACE_USER = os.getenv("GRACE_USER", "yhs5")
+GRACE_USER = "yhs5"
 JOB_STATUS_CACHE = {}  # In production, use Redis or database
 
 
@@ -225,9 +222,9 @@ def run_job():
         user_id_clean = re.sub(r"\W+", "", user_id)
 
         # Basic validation
-        if model not in ["drn"]:
+        if model not in ["drn", "scepter"]:
             return (
-                jsonify({"error": "Only DRN model supported currently"}),
+                jsonify({"error": "Only DRN and SCEPTER models supported currently"}),
                 400,
             )
         if not isinstance(parameters, dict):
@@ -235,8 +232,8 @@ def run_job():
 
         # Create unique job folder on Grace server (via SSH)
         timestamp = int(time.time())
-        project_path = "DRN"
-        job_folder = f"/home/{GRACE_USER}/project/{project_path}/tmp_{model}_job_{user_id_clean}_{timestamp}"
+        project_path = "DRN" if model == "drn" else "SCEPTER"
+        job_folder = f"/home/yhs5/project/{project_path}/tmp_{model}_job_{user_id_clean}_{timestamp}"
 
         # Connect to Grace via SSH
         ssh = get_ssh_connection()
@@ -259,8 +256,8 @@ def run_job():
                 )
 
         # Submit to SLURM using sbatch via SSH
-        project_path = "DRN"
-        script_name = "run_drn_job.sh"
+        project_path = "DRN" if model == "drn" else "SCEPTER"
+        script_name = "run_drn_job.sh" if model == "drn" else "run_scepter_job.sh"
         sbatch_cmd = f"sbatch /home/{GRACE_USER}/project/{project_path}/{script_name} {job_folder}"
         stdin, stdout, stderr = ssh.exec_command(sbatch_cmd)
 
@@ -482,7 +479,7 @@ def submit_full_drn_pipeline():
 
         # Generate unique job ID immediately
         timestamp = int(time.time())
-        job_id = f"drn_{str(timestamp)[-5:]}"
+        job_id = f"drn_full_{timestamp}_{hash(str(coordinates)) % 10000}"
         job_folder = f"/home/{GRACE_USER}/project/DRN/jobs/{job_id}"
         output_dir = f"{job_folder}/output"
         drn_path = f"/home/{GRACE_USER}/project/DRN"
@@ -544,7 +541,7 @@ def submit_full_drn_pipeline():
 
                 # Create SLURM job script for full pipeline
                 sbatch_script = f"""#!/bin/bash
-#SBATCH --job-name={job_id[:12]}
+#SBATCH --job-name=drn_full_{job_id[:12]}
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=64G
@@ -711,33 +708,11 @@ echo "=========================================="
                 error = stderr.read().decode().strip()
                 exit_status = stdout.channel.recv_exit_status()
 
+                ssh.close()
+
                 if exit_status == 0 and "Submitted batch job" in result:
                     # Extract Grace job ID from sbatch output
                     grace_job_id = result.split()[-1]
-
-                    # Save grace_job_id to a file in the job folder for persistence
-                    # This ensures we can recover it even if the server restarts
-                    try:
-                        save_job_id_cmd = (
-                            f"echo '{grace_job_id}' > {job_folder}/.grace_job_id"
-                        )
-                        stdin2, stdout2, stderr2 = ssh.exec_command(save_job_id_cmd)
-                        exit_status2 = stdout2.channel.recv_exit_status()
-                        if exit_status2 == 0:
-                            app.logger.info(
-                                f"Saved grace_job_id {grace_job_id} to {job_folder}/.grace_job_id"
-                            )
-                        else:
-                            app.logger.warning(
-                                f"Failed to save grace_job_id to file: {stderr2.read().decode()}"
-                            )
-                    except Exception as save_error:
-                        app.logger.warning(
-                            f"Error saving grace_job_id to file: {str(save_error)}"
-                        )
-
-                    # Close SSH connection after saving grace_job_id
-                    ssh.close()
 
                     # Update cache with submitted status
                     JOB_STATUS_CACHE[job_id].update(
@@ -750,8 +725,6 @@ echo "=========================================="
                         f"Job {job_id} submitted successfully with Grace job ID {grace_job_id}"
                     )
                 else:
-                    # Close SSH connection before handling error
-                    ssh.close()
                     # Update cache with failed status
                     JOB_STATUS_CACHE[job_id].update(
                         {
@@ -760,42 +733,19 @@ echo "=========================================="
                         }
                     )
                     app.logger.error(f"Job {job_id} submission failed: {error}")
-                    # Check if error is related to disk quota
-                    if "quota" in error.lower() or "disk" in error.lower():
-                        JOB_STATUS_CACHE[job_id].update(
-                            {
-                                "status": "failed",
-                                "error": f"Disk quota issue detected: {error}. Please clean up old job files.",
-                            }
-                        )
             except Exception as e:
                 import traceback
 
                 error_traceback = traceback.format_exc()
-                error_msg = str(e)
                 app.logger.error(
-                    f"Error in background submission for job {job_id}: {error_msg}"
+                    f"Error in background submission for job {job_id}: {str(e)}"
                 )
                 app.logger.error(f"Traceback: {error_traceback}")
-
-                # Close SSH connection if it exists
-                try:
-                    if "ssh" in locals() and ssh:
-                        ssh.close()
-                except:
-                    pass
-
-                # Check if error is related to disk quota
-                if "quota" in error_msg.lower() or "disk" in error_msg.lower():
-                    error_msg = (
-                        f"Disk quota issue: {error_msg}. Please clean up old job files."
-                    )
-
                 # Update cache with error status
                 JOB_STATUS_CACHE[job_id].update(
                     {
                         "status": "failed",
-                        "error": f"Backend error: {error_msg}",
+                        "error": f"Backend error: {str(e)}",
                     }
                 )
 
@@ -859,16 +809,6 @@ def check_full_pipeline_status(job_id):
     try:
         # Get cached job info
         job_info = JOB_STATUS_CACHE.get(job_id, {})
-        
-        # Log cache state for debugging
-        if not job_info:
-            app.logger.warning(
-                f"[Status Check] Job {job_id} - Not found in cache at all! Cache keys: {list(JOB_STATUS_CACHE.keys())[:10]}"
-            )
-        else:
-            app.logger.debug(
-                f"[Status Check] Job {job_id} - Cache entry found with keys: {list(job_info.keys())}"
-            )
 
         # Check if job already failed (from background thread)
         if job_info.get("status") == "failed":
@@ -888,43 +828,15 @@ def check_full_pipeline_status(job_id):
         job_folder = job_info.get(
             "job_folder", f"/home/{GRACE_USER}/project/DRN/jobs/{job_id}"
         )
-        submitted_at = job_info.get("submitted_at")
-        if submitted_at is None:
-            # If not in cache, this is likely a very early status check
-            # Use current time as fallback, but log a warning
-            submitted_at = time.time()
-            app.logger.warning(
-                f"[Status Check] Job {job_id} - submitted_at not found in cache, using current time as fallback"
-            )
+        submitted_at = job_info.get("submitted_at", time.time())
         time_elapsed = time.time() - submitted_at
-        app.logger.info(
-            f"[Status Check] Job {job_id} - submitted_at: {submitted_at}, current_time: {time.time()}, time_elapsed: {time_elapsed:.2f} seconds ({time_elapsed/60:.2f} minutes)"
-        )
 
-        # If background thread is still submitting (no grace_job_id yet) and it's been less than 60 seconds,
-        # avoid SSH connection to prevent race condition with background thread that's connecting
-        # This handles cases where Duo 2FA takes time to complete
-        if not grace_job_id and time_elapsed < 120:
-            app.logger.info(
-                f"[Status Check] Job {job_id} - Background submission still in progress (grace_job_id=None, time_elapsed: {time_elapsed:.2f}s), skipping SSH connection to avoid race condition"
-            )
-            return jsonify(
-                {
-                    "job_id": job_id,
-                    "grace_job_id": grace_job_id,
-                    "status": "submitting",
-                    "message": "Job is being submitted to Grace HPC. Please wait...",
-                    "submitted_at": submitted_at,
-                    "logs": [],
-                }
-            )
-
-        # Connect to Grace via SSH using pooled connection to avoid repeated DUO authentication
+        # Connect to Grace via SSH
         try:
-            ssh = get_ssh_connection_pooled()
+            ssh = get_ssh_connection()
         except Exception as ssh_error:
             app.logger.error(
-                f"SSH connection failed for job {job_id}: {str(ssh_error)} (time_elapsed: {time_elapsed:.2f}s)"
+                f"SSH connection failed for job {job_id}: {str(ssh_error)}"
             )
             # If still within submission window, return submitting status
             if time_elapsed < 300:
@@ -950,23 +862,17 @@ def check_full_pipeline_status(job_id):
 
         # If job not in cache or grace_job_id is None, try to recover by checking if job folder exists
         if not grace_job_id:
-            app.logger.info(
-                f"[Status Check] Job {job_id} - grace_job_id is None, attempting recovery..."
-            )
             # Check if job folder exists on Grace
             check_folder_cmd = (
                 f"test -d {job_folder} && echo 'exists' || echo 'not_found'"
             )
             stdin, stdout, stderr = ssh.exec_command(check_folder_cmd)
             folder_exists = stdout.read().decode().strip()
-            app.logger.info(
-                f"[Status Check] Job {job_id} - Folder check result: '{folder_exists}', job_folder: '{job_folder}'"
-            )
 
             if folder_exists == "not_found":
                 # Folder doesn't exist yet - check if still within submission window
                 if time_elapsed < 300:  # Less than 5 minutes
-                    # Don't close pooled connection
+                    ssh.close()
                     return jsonify(
                         {
                             "job_id": job_id,
@@ -977,7 +883,7 @@ def check_full_pipeline_status(job_id):
                     )
                 else:
                     # Submission timeout
-                    # Don't close pooled connection
+                    ssh.close()
                     return (
                         jsonify(
                             {
@@ -988,133 +894,31 @@ def check_full_pipeline_status(job_id):
                         404,
                     )
 
-            # Try to recover grace_job_id from saved file first (most reliable)
-            read_job_id_cmd = f"cat {job_folder}/.grace_job_id 2>/dev/null || echo ''"
-            stdin, stdout, stderr = ssh.exec_command(read_job_id_cmd)
+            # Try to find grace_job_id from log files
+            find_job_id_cmd = f"grep -h 'Submitted batch job' {job_folder}/*.out 2>/dev/null | tail -1 | awk '{{print $NF}}'"
+            stdin, stdout, stderr = ssh.exec_command(find_job_id_cmd)
             recovered_job_id = stdout.read().decode().strip()
-            app.logger.info(
-                f"[Status Check] Job {job_id} - Attempted to recover grace_job_id from .grace_job_id file: '{recovered_job_id}'"
-            )
-
-            # If not found in file, try to find it from log files (fallback)
-            if not recovered_job_id:
-                find_job_id_cmd = f"grep -h 'Submitted batch job' {job_folder}/*.out 2>/dev/null | tail -1 | awk '{{print $NF}}'"
-                stdin2, stdout2, stderr2 = ssh.exec_command(find_job_id_cmd)
-                recovered_job_id = stdout2.read().decode().strip()
-                app.logger.info(
-                    f"[Status Check] Job {job_id} - Attempted to recover grace_job_id from logs: '{recovered_job_id}'"
-                )
 
             if recovered_job_id:
                 grace_job_id = recovered_job_id
-
-                # If we recovered from logs (not from file), save it to file for future use
-                # Check if file exists on Grace
-                check_file_cmd = f"test -f {job_folder}/.grace_job_id && echo 'exists' || echo 'not_exists'"
-                stdin3, stdout3, stderr3 = ssh.exec_command(check_file_cmd)
-                file_exists = stdout3.read().decode().strip()
-
-                if file_exists == "not_exists":
-                    # File doesn't exist, save the recovered grace_job_id
-                    try:
-                        save_job_id_cmd = (
-                            f"echo '{grace_job_id}' > {job_folder}/.grace_job_id"
-                        )
-                        stdin4, stdout4, stderr4 = ssh.exec_command(save_job_id_cmd)
-                        exit_status4 = stdout4.channel.recv_exit_status()
-                        if exit_status4 == 0:
-                            app.logger.info(
-                                f"Saved recovered grace_job_id {grace_job_id} to {job_folder}/.grace_job_id"
-                            )
-                    except Exception as save_error:
-                        app.logger.warning(
-                            f"Error saving recovered grace_job_id to file: {str(save_error)}"
-                        )
-
-                # Reconstruct job_info and cache it, preserving existing cache data
-                existing_job_info = JOB_STATUS_CACHE.get(job_id, {})
+                # Reconstruct job_info and cache it
                 job_info = {
                     "job_id": job_id,
                     "grace_job_id": grace_job_id,
                     "job_folder": job_folder,
-                    "submitted_at": existing_job_info.get("submitted_at", time.time()),  # Preserve submitted_at
-                    "status": existing_job_info.get("status", "submitted"),  # Preserve status
-                    "parameters": existing_job_info.get("parameters"),  # Preserve parameters
-                    "output_dir": existing_job_info.get("output_dir"),  # Preserve output_dir
                 }
                 JOB_STATUS_CACHE[job_id] = job_info
                 app.logger.info(
-                    f"Recovered job {job_id} with grace_job_id {grace_job_id} (preserved submitted_at: {job_info.get('submitted_at')})"
+                    f"Recovered job {job_id} with grace_job_id {grace_job_id}"
                 )
             else:
                 # Job folder exists but no job_id found - check completion status first
-                app.logger.info(
-                    f"[Status Check] Job {job_id} - No grace_job_id found in logs, checking completion status..."
-                )
+                check_completion_cmd = f"test -f {job_folder}/.completed && echo 'completed' || echo 'unknown'"
+                stdin, stdout, stderr = ssh.exec_command(check_completion_cmd)
+                completion_status = stdout.read().decode().strip()
 
-                # Check multiple indicators of completion
-                # 1. Check for .completed marker file
-                try:
-                    check_completion_cmd = f"test -f {job_folder}/.completed && echo 'completed' || echo 'not_completed'"
-                    stdin, stdout, stderr = ssh.exec_command(check_completion_cmd)
-                    exit_status = stdout.channel.recv_exit_status()
-                    completion_status = stdout.read().decode().strip()
-                    stderr_content = stderr.read().decode().strip()
-                    app.logger.info(
-                        f"[Status Check] Job {job_id} - Completion marker check: '{completion_status}', exit_status: {exit_status}, stderr: '{stderr_content}'"
-                    )
-                except Exception as e:
-                    app.logger.warning(
-                        f"[Status Check] Job {job_id} - Error checking completion marker: {str(e)}"
-                    )
-                    completion_status = "not_completed"
-
-                # 2. Also check if output files exist (alternative completion indicator)
-                try:
-                    check_output_cmd = f"ls {job_folder}/output 2>/dev/null | head -1 && echo 'has_output' || echo 'no_output'"
-                    stdin2, stdout2, stderr2 = ssh.exec_command(check_output_cmd)
-                    exit_status2 = stdout2.channel.recv_exit_status()
-                    output_check = stdout2.read().decode().strip()
-                    app.logger.info(
-                        f"[Status Check] Job {job_id} - Output check: '{output_check}', exit_status: {exit_status2}"
-                    )
-                except Exception as e:
-                    app.logger.warning(
-                        f"[Status Check] Job {job_id} - Error checking output: {str(e)}"
-                    )
-                    output_check = "no_output"
-
-                # 3. Check log files for completion messages
-                try:
-                    check_log_cmd = f"grep -l 'All steps completed\\|Job completed\\|Pipeline completed' {job_folder}/*.out 2>/dev/null | head -1 && echo 'has_completion_log' || echo 'no_completion_log'"
-                    stdin3, stdout3, stderr3 = ssh.exec_command(check_log_cmd)
-                    exit_status3 = stdout3.channel.recv_exit_status()
-                    log_check = stdout3.read().decode().strip()
-                    app.logger.info(
-                        f"[Status Check] Job {job_id} - Log completion check: '{log_check}', exit_status: {exit_status3}"
-                    )
-                except Exception as e:
-                    app.logger.warning(
-                        f"[Status Check] Job {job_id} - Error checking logs: {str(e)}"
-                    )
-                    log_check = "no_completion_log"
-
-                # If any completion indicator is found, mark as completed
-                is_completed = (
-                    completion_status == "completed"
-                    or "has_output" in output_check
-                    or "has_completion_log" in log_check
-                )
-
-                app.logger.info(
-                    f"[Status Check] Job {job_id} - Overall completion check result: is_completed={is_completed}"
-                )
-
-                if is_completed:
-                    app.logger.info(
-                        f"[Status Check] Job {job_id} - Job is COMPLETED (found completion indicator)"
-                    )
-                    # Don't close pooled connection
+                if completion_status == "completed":
+                    ssh.close()
                     return jsonify(
                         {
                             "job_id": job_id,
@@ -1125,15 +929,9 @@ def check_full_pipeline_status(job_id):
                 else:
                     # Job folder exists but no job_id and not completed
                     # Check if still within submission window
-                    app.logger.info(
-                        f"[Status Check] Job {job_id} - Not completed, time_elapsed: {time_elapsed}s"
-                    )
                     if time_elapsed < 300:  # Less than 5 minutes
                         # Still submitting - SLURM job hasn't been submitted yet
-                        app.logger.info(
-                            f"[Status Check] Job {job_id} - Returning 'submitting' (time_elapsed < 300s)"
-                        )
-                        # Don't close pooled connection
+                        ssh.close()
                         return jsonify(
                             {
                                 "job_id": job_id,
@@ -1144,10 +942,7 @@ def check_full_pipeline_status(job_id):
                         )
                     else:
                         # Submission timeout - something went wrong
-                        app.logger.warning(
-                            f"[Status Check] Job {job_id} - Time elapsed > 300s but no completion marker and no grace_job_id"
-                        )
-                        # Don't close pooled connection
+                        ssh.close()
                         return (
                             jsonify(
                                 {
@@ -1159,137 +954,8 @@ def check_full_pipeline_status(job_id):
                         )
 
         # Ensure grace_job_id is not None before checking SLURM
-        # But first, check if job is completed even without grace_job_id
         if not grace_job_id:
-            # Check if job is completed before assuming it's still submitting
-            check_completion_cmd = f"test -f {job_folder}/.completed && echo 'completed' || echo 'not_completed'"
-            stdin, stdout, stderr = ssh.exec_command(check_completion_cmd)
-            completion_check = stdout.read().decode().strip()
-            app.logger.info(
-                f"[Status Check] Job {job_id} - grace_job_id is None, checking completion: '{completion_check}'"
-            )
-
-            if completion_check == "completed":
-                # Job is completed even though we don't have grace_job_id
-                # Don't close pooled connection
-                return jsonify(
-                    {
-                        "job_id": job_id,
-                        "grace_job_id": None,
-                        "status": "completed",
-                        "message": "Job completed (recovered from Grace filesystem)",
-                    }
-                )
-
-            # Job not completed, check time elapsed
-            if time_elapsed < 300:  # Less than 5 minutes
-                # Don't close pooled connection
-                return jsonify(
-                    {
-                        "job_id": job_id,
-                        "grace_job_id": None,
-                        "status": "submitting",
-                        "message": "Job is being submitted to Grace HPC. Please wait...",
-                    }
-                )
-            else:
-                # Time elapsed > 5 minutes but no grace_job_id and not completed
-                # Don't close pooled connection
-                return jsonify(
-                    {
-                        "job_id": job_id,
-                        "grace_job_id": None,
-                        "status": "unknown",
-                        "message": "Job status cannot be determined. The job may be in an unknown state.",
-                    }
-                )
-
-        job_folder = job_info.get(
-            "job_folder", f"/home/{GRACE_USER}/project/DRN/jobs/{job_id}"
-        )
-        cached_status = job_info.get("status")
-
-        # Initialize status with a default value to prevent undefined
-        status = "unknown"
-
-        # If job was just submitted successfully (has grace_job_id and cached status is "submitted"),
-        # check SLURM first to see if it's already progressed, then return appropriate status
-        if grace_job_id and cached_status == "submitted":
-            app.logger.info(
-                f"[Status Check] Job {job_id} - Job successfully submitted with grace_job_id {grace_job_id}, checking SLURM status"
-            )
-            # Check SLURM to see if it's moved to pending/running/completed
-            squeue_cmd = f"squeue -j {grace_job_id} --format='%T' --noheader"
-            stdin, stdout, stderr = ssh.exec_command(squeue_cmd)
-            slurm_status_raw = stdout.read().decode().strip()
-            slurm_status = slurm_status_raw.split("\n")[0] if slurm_status_raw else ""
-            
-            if slurm_status:
-                # Job is already in queue, use SLURM status (don't go back to "submitted")
-                status_map = {
-                    "PENDING": "pending",
-                    "RUNNING": "running",
-                    "COMPLETED": "completed",
-                    "FAILED": "failed",
-                    "CANCELLED": "failed",
-                    "TIMEOUT": "failed",
-                }
-                status = status_map.get(slurm_status, "submitted")
-                app.logger.info(
-                    f"[Status Check] Job {job_id} - Found in SLURM queue: '{slurm_status}' -> '{status}' (not changing back to submitted)"
-                )
-                # Update cache with the actual status
-                job_info["status"] = status
-                JOB_STATUS_CACHE[job_id] = job_info
-            else:
-                # Not in queue yet, but we know it was submitted - return "submitted"
-                status = "submitted"
-                app.logger.info(
-                    f"[Status Check] Job {job_id} - Not in SLURM queue yet, returning 'submitted' status"
-                )
-            
-            # Return immediately with current status
-            return jsonify(
-                {
-                    "job_id": job_id,
-                    "grace_job_id": grace_job_id,
-                    "status": status,
-                    "submitted_at": submitted_at,
-                    "logs": [],
-                    "message": f"Job submitted successfully to Grace HPC with job ID {grace_job_id}" if status == "submitted" else None,
-                }
-            )
-        
-        # If cached status is already "running", "pending", or "completed", don't override it
-        # Continue with normal SLURM checking logic below
-        if grace_job_id and cached_status in ["running", "pending", "completed"]:
-            app.logger.info(
-                f"[Status Check] Job {job_id} - Cached status is already '{cached_status}', proceeding with normal status check"
-            )
-
-        # Ensure grace_job_id is valid before using it
-        if not grace_job_id or not isinstance(grace_job_id, str):
-            app.logger.warning(f"Invalid grace_job_id for job {job_id}: {grace_job_id}")
-            # Check if job is completed before assuming it's still submitting
-            check_completion_cmd = f"test -f {job_folder}/.completed && echo 'completed' || echo 'not_completed'"
-            stdin, stdout, stderr = ssh.exec_command(check_completion_cmd)
-            completion_check = stdout.read().decode().strip()
-            app.logger.info(
-                f"[Status Check] Job {job_id} - Invalid grace_job_id, checking completion: '{completion_check}'"
-            )
-
-            if completion_check == "completed":
-                # Don't close pooled connection
-                return jsonify(
-                    {
-                        "job_id": job_id,
-                        "grace_job_id": None,
-                        "status": "completed",
-                        "message": "Job completed (recovered from Grace filesystem)",
-                    }
-                )
-
-            # Don't close pooled connection
+            ssh.close()
             return jsonify(
                 {
                     "job_id": job_id,
@@ -1299,15 +965,16 @@ def check_full_pipeline_status(job_id):
                 }
             )
 
+        job_folder = job_info.get(
+            "job_folder", f"/home/{GRACE_USER}/project/DRN/jobs/{job_id}"
+        )
+        cached_status = job_info.get("status")
+
         # Check SLURM job status
         squeue_cmd = f"squeue -j {grace_job_id} --format='%T' --noheader"
         stdin, stdout, stderr = ssh.exec_command(squeue_cmd)
         slurm_status_raw = stdout.read().decode().strip()
         slurm_status = slurm_status_raw.split("\n")[0] if slurm_status_raw else ""
-
-        app.logger.info(
-            f"[Status Check] Job {job_id} - squeue result: '{slurm_status_raw}' -> parsed: '{slurm_status}'"
-        )
 
         # Map SLURM status
         status_map = {
@@ -1322,175 +989,52 @@ def check_full_pipeline_status(job_id):
         if slurm_status:
             # Job found in queue
             status = status_map.get(slurm_status, "unknown")
-            app.logger.info(
-                f"[Status Check] Job {job_id} - Found in SLURM queue with status: '{slurm_status}' -> mapped to: '{status}'"
-            )
             # If status is unknown from SLURM, check if job actually completed
             if status == "unknown":
                 check_cmd = f"test -f {job_folder}/.completed && echo 'completed' || echo 'unknown'"
                 stdin, stdout, stderr = ssh.exec_command(check_cmd)
                 output_check = stdout.read().decode().strip()
-                app.logger.info(
-                    f"[Status Check] Job {job_id} - Unknown SLURM status, checking completion marker: '{output_check}'"
-                )
                 if output_check == "completed":
                     status = "completed"
-                    app.logger.info(
-                        f"[Status Check] Job {job_id} - Completion marker found, setting status to 'completed'"
-                    )
         else:
-            # Job not in queue - first check if it's completed (most important check)
-            app.logger.info(
-                f"[Status Check] Job {job_id} - Not in SLURM queue, checking completion marker..."
-            )
-            check_completion_cmd = f"test -f {job_folder}/.completed && echo 'completed' || echo 'not_completed'"
-            stdin, stdout, stderr = ssh.exec_command(check_completion_cmd)
-            completion_check = stdout.read().decode().strip()
-            app.logger.info(
-                f"[Status Check] Job {job_id} - Completion marker check result: '{completion_check}'"
-            )
+            # Job not in queue - check if it was just submitted
+            if cached_status == "submitted":
+                # Job was just submitted but not in queue yet - check sacct
+                sacct_cmd = f"sacct -j {grace_job_id} --format=State --noheader --parsable2 2>/dev/null | head -1 | cut -d'|' -f1"
+                stdin2, stdout2, stderr2 = ssh.exec_command(sacct_cmd)
+                sacct_status = stdout2.read().decode().strip()
 
-            if completion_check == "completed":
-                # Job is completed - verify with sacct if we have grace_job_id
-                app.logger.info(
-                    f"[Status Check] Job {job_id} - Completion marker found, verifying with sacct..."
-                )
-                if grace_job_id:
-                    sacct_cmd = f"sacct -j {grace_job_id} --format=State --noheader --parsable2 2>/dev/null | head -1 | cut -d'|' -f1"
-                    stdin2, stdout2, stderr2 = ssh.exec_command(sacct_cmd)
-                    sacct_status = stdout2.read().decode().strip()
-                    app.logger.info(
-                        f"[Status Check] Job {job_id} - sacct result: '{sacct_status}'"
-                    )
-                    if sacct_status:
-                        status = status_map.get(sacct_status, "completed")
-                        app.logger.info(
-                            f"[Status Check] Job {job_id} - sacct status '{sacct_status}' mapped to: '{status}'"
-                        )
-                    else:
-                        status = "completed"  # Completion marker exists, trust it
-                        app.logger.info(
-                            f"[Status Check] Job {job_id} - sacct returned empty, but completion marker exists. Setting status to 'completed'"
-                        )
+                if sacct_status:
+                    # Job found in sacct - use that status
+                    status = status_map.get(sacct_status, "submitted")
                 else:
-                    status = "completed"  # Completion marker exists
-                    app.logger.info(
-                        f"[Status Check] Job {job_id} - No grace_job_id, but completion marker exists. Setting status to 'completed'"
-                    )
+                    # Job not found in either - still transitioning, return "submitted"
+                    status = "submitted"
             else:
-                # Job not completed - check if it was just submitted or is still running
-                app.logger.info(
-                    f"[Status Check] Job {job_id} - Not completed. Cached status: '{cached_status}', time_elapsed: {time_elapsed}s"
-                )
-                # If cached status is already "running" or "pending", preserve it (don't go back to "submitted")
-                if cached_status in ["running", "pending"]:
-                    status = cached_status
-                    app.logger.info(
-                        f"[Status Check] Job {job_id} - Preserving cached status '{cached_status}' (not changing back to submitted)"
-                    )
-                elif cached_status == "submitted":
-                    # Job was just submitted but not in queue yet - check sacct
-                    sacct_cmd = f"sacct -j {grace_job_id} --format=State --noheader --parsable2 2>/dev/null | head -1 | cut -d'|' -f1"
-                    stdin2, stdout2, stderr2 = ssh.exec_command(sacct_cmd)
-                    sacct_status = stdout2.read().decode().strip()
-                    app.logger.info(
-                        f"[Status Check] Job {job_id} - Checking sacct (cached_status='submitted'): '{sacct_status}'"
-                    )
-
-                    if sacct_status:
-                        # Job found in sacct - use that status
-                        status = status_map.get(sacct_status, "submitted")
-                        app.logger.info(
-                            f"[Status Check] Job {job_id} - sacct status '{sacct_status}' mapped to: '{status}'"
-                        )
-                    else:
-                        # Job not found in either - still transitioning, return "submitted"
-                        status = "submitted"
-                        app.logger.info(
-                            f"[Status Check] Job {job_id} - sacct returned empty, setting status to 'submitted'"
-                        )
+                # Job not in queue and wasn't just submitted - check completion marker and log files
+                check_cmd = f"test -f {job_folder}/.completed && echo 'completed' || (test -f {job_folder}/*.out && echo 'running' || echo 'unknown')"
+                stdin, stdout, stderr = ssh.exec_command(check_cmd)
+                output_check = stdout.read().decode().strip()
+                if output_check == "completed":
+                    status = "completed"
+                elif output_check == "running":
+                    # Check log files to see if job is actually running
+                    log_check = f"tail -n 5 {job_folder}/*.out 2>/dev/null | grep -q 'Step' && echo 'running' || echo 'unknown'"
+                    stdin2, stdout2, stderr2 = ssh.exec_command(log_check)
+                    log_output = stdout2.read().decode().strip()
+                    status = "running" if log_output == "running" else "unknown"
                 else:
-                    # Unknown cached status - check logs to determine status
-                    check_cmd = f"test -f {job_folder}/*.out && echo 'has_logs' || echo 'no_logs'"
-                    stdin, stdout, stderr = ssh.exec_command(check_cmd)
-                    output_check = stdout.read().decode().strip()
-                    app.logger.info(
-                        f"[Status Check] Job {job_id} - Log file check: '{output_check}'"
-                    )
-                    if output_check == "has_logs":
-                        # Check log files to see if job is actually running
-                        log_check = f"tail -n 5 {job_folder}/*.out 2>/dev/null | grep -q 'Step' && echo 'running' || echo 'unknown'"
-                        stdin2, stdout2, stderr2 = ssh.exec_command(log_check)
-                        log_output = stdout2.read().decode().strip()
-                        status = "running" if log_output == "running" else "unknown"
-                        app.logger.info(
-                            f"[Status Check] Job {job_id} - Log check result: '{log_output}' -> status: '{status}'"
-                        )
-                    else:
-                        # No logs yet - might still be submitting
-                        if time_elapsed < 300:  # Less than 5 minutes
-                            status = "submitting"
-                            app.logger.info(
-                                f"[Status Check] Job {job_id} - No logs, time_elapsed={time_elapsed}s < 300s, setting status to 'submitting'"
-                            )
-                        else:
-                            status = "unknown"
-                            app.logger.info(
-                                f"[Status Check] Job {job_id} - No logs, time_elapsed={time_elapsed}s >= 300s, setting status to 'unknown'"
-                            )
-
-        app.logger.info(
-            f"[Status Check] Job {job_id} - Final status determined: '{status}'"
-        )
+                    status = "unknown"
 
         # Get latest log output and detect current step
         logs = []
         current_step = None
         step_progress = None
-        error_message = None
 
         if status in ["running", "completed", "failed"]:
-            # Check both .out and .err files for errors
             log_cmd = f"tail -n 100 {job_folder}/*.out 2>/dev/null || echo 'No log file found'"
             stdin, stdout, stderr = ssh.exec_command(log_cmd)
             log_content = stdout.read().decode()
-
-            # Also check .err files for error messages
-            err_cmd = f"tail -n 50 {job_folder}/*.err 2>/dev/null || echo ''"
-            stdin_err, stdout_err, stderr_err = ssh.exec_command(err_cmd)
-            err_content = stdout_err.read().decode()
-
-            # Combine logs and errors
-            all_log_content = (
-                log_content + "\n" + err_content if err_content else log_content
-            )
-
-            # Check for disk quota errors
-            if (
-                "Disk quota exceeded" in all_log_content
-                or "quota exceeded" in all_log_content.lower()
-                or "Disk quota" in all_log_content
-            ):
-                status = "failed"
-                error_message = "Disk quota exceeded on Grace HPC. Please clean up old job files or contact the system administrator."
-                app.logger.error(
-                    f"[Status Check] Job {job_id} - Disk quota exceeded detected in logs"
-                )
-
-            # Check for other common errors
-            if "ERROR:" in all_log_content or "Error:" in all_log_content:
-                # Extract error message from logs
-                error_lines = [
-                    line
-                    for line in all_log_content.split("\n")
-                    if "ERROR" in line or "Error:" in line
-                ]
-                if error_lines and not error_message:
-                    # Get the most recent error
-                    error_message = error_lines[-1].strip()
-                    if len(error_message) > 200:
-                        error_message = error_message[:200] + "..."
-
             if log_content:
                 logs = log_content.split("\n")[-20:]  # Last 20 lines
 
@@ -1574,11 +1118,6 @@ def check_full_pipeline_status(job_id):
                         "status": "running",
                     }
 
-        # Ensure status is always a valid string (never None or undefined)
-        # This prevents Firebase errors when frontend tries to update Firestore
-        if not status or not isinstance(status, str):
-            status = "unknown"
-
         # Update cache
         job_info["status"] = status
         if current_step:
@@ -1587,43 +1126,28 @@ def check_full_pipeline_status(job_id):
             job_info["step_progress"] = step_progress
         JOB_STATUS_CACHE[job_id] = job_info
 
-        # Don't close pooled connection - keep it for reuse
-        # ssh.close()
+        ssh.close()
 
-        response_data = {
-            "job_id": job_id,
-            "grace_job_id": grace_job_id,
-            "status": status,  # Guaranteed to be a valid string
-            "submitted_at": job_info.get("submitted_at")
-            or time.time(),  # Ensure never None
-            "logs": logs or [],  # Ensure logs is always a list
-            "current_step": current_step,  # Can be None
-            "step_progress": step_progress,  # Can be None
-        }
-
-        # Add error message if detected
-        if error_message:
-            response_data["error"] = error_message
-            # Update cache with error status
-            job_info["status"] = "failed"
-            job_info["error"] = error_message
-            JOB_STATUS_CACHE[job_id] = job_info
-
-        return jsonify(response_data)
+        return jsonify(
+            {
+                "job_id": job_id,
+                "grace_job_id": grace_job_id,
+                "status": status,
+                "submitted_at": job_info.get("submitted_at"),
+                "logs": logs,
+                "current_step": current_step,
+                "step_progress": step_progress,
+            }
+        )
 
     except Exception as e:
-        import traceback
-
-        error_traceback = traceback.format_exc()
         app.logger.error(f"Error in check_full_pipeline_status for {job_id}: {str(e)}")
-        app.logger.error(f"Traceback: {error_traceback}")
         return (
             jsonify(
                 {
                     "job_id": job_id,
                     "status": "unknown",
                     "error": f"Status check failed: {str(e)}",
-                    "details": error_traceback if app.debug else None,
                 }
             ),
             500,
@@ -2965,116 +2489,30 @@ def download_full_pipeline_results(job_id):
         )
         output_dir = job_info.get("output_dir", f"{job_folder}/output")
 
-        # Connect to Grace via SSH using pooled connection to avoid repeated DUO authentication
-        try:
-            ssh = get_ssh_connection_pooled()
-        except Exception as ssh_error:
-            error_msg = str(ssh_error)
-            app.logger.error(
-                f"SSH connection failed for download {job_id}: {error_msg}"
-            )
-            if "Authentication failed" in error_msg or "Anomalous request" in error_msg:
-                return (
-                    jsonify(
-                        {
-                            "error": "Authentication failed. Please wait a minute and try again. Too many connection attempts may trigger security measures.",
-                            "job_id": job_id,
-                        }
-                    ),
-                    429,  # Too Many Requests
-                )
-            return (
-                jsonify(
-                    {
-                        "error": f"Failed to connect to Grace HPC: {error_msg}",
-                        "job_id": job_id,
-                    }
-                ),
-                500,
-            )
+        # Connect to Grace via SSH
+        ssh = get_ssh_connection()
 
         # Allow download even if job is still running (downloads whatever is available)
         # Create a zip file on Grace and download it
-        # Include both output folder and PDF files
-        try:
-            pdf_dir = f"{output_dir}/figure/ode_output"
+        zip_cmd = f"cd {job_folder} && zip -r results.zip output/ 2>&1"
+        stdin, stdout, stderr = ssh.exec_command(zip_cmd)
+        exit_status = stdout.channel.recv_exit_status()
 
-            # Create zip with output folder (which includes PDFs in output/figure/ode_output/)
-            # The -r flag recursively includes all subdirectories, so PDFs should be included
-            zip_cmd = f"cd {job_folder} && zip -r results.zip output/ 2>&1"
-            stdin, stdout, stderr = ssh.exec_command(zip_cmd, timeout=120)
-            exit_status = stdout.channel.recv_exit_status()
-            zip_output = stdout.read().decode()
+        if exit_status != 0:
             error_msg = stderr.read().decode()
+            ssh.close()
+            return jsonify({"error": f"Failed to create zip: {error_msg}"}), 500
 
-            if exit_status != 0:
-                app.logger.error(f"Failed to create zip for {job_id}: {error_msg}")
-                # Don't close pooled connection
-                return jsonify({"error": f"Failed to create zip: {error_msg}"}), 500
+        # Download the zip file
+        sftp = ssh.open_sftp()
+        zip_path = f"{job_folder}/results.zip"
 
-            # Verify PDFs are included by checking if PDF directory exists and counting PDFs
-            check_pdf_cmd = f"test -d {pdf_dir} && find {pdf_dir} -name '*.pdf' -type f 2>/dev/null | wc -l || echo '0'"
-            stdin_pdf, stdout_pdf, stderr_pdf = ssh.exec_command(check_pdf_cmd)
-            pdf_count = stdout_pdf.read().decode().strip()
-
-            # Verify PDFs are in the zip file
-            verify_zip_cmd = f"cd {job_folder} && unzip -l results.zip 2>/dev/null | grep -c '\.pdf$' || echo '0'"
-            stdin_verify, stdout_verify, stderr_verify = ssh.exec_command(
-                verify_zip_cmd
-            )
-            pdfs_in_zip = stdout_verify.read().decode().strip()
-
-            if pdf_count and pdf_count != "0":
-                app.logger.info(
-                    f"Job {job_id}: Found {pdf_count} PDF files in {pdf_dir}, {pdfs_in_zip} PDFs in zip file"
-                )
-                if pdfs_in_zip == "0" or int(pdfs_in_zip) < int(pdf_count):
-                    # PDFs not fully included, add them explicitly
-                    # Use relative path from job_folder: output/figure/ode_output/
-                    app.logger.warning(
-                        f"Job {job_id}: Not all PDFs in zip ({pdfs_in_zip}/{pdf_count}), adding them explicitly"
-                    )
-                    add_pdf_cmd = f"cd {job_folder} && zip -r results.zip output/figure/ode_output/*.pdf 2>&1"
-                    stdin_add, stdout_add, stderr_add = ssh.exec_command(
-                        add_pdf_cmd, timeout=60
-                    )
-                    add_exit_status = stdout_add.channel.recv_exit_status()
-                    add_error = stderr_add.read().decode()
-                    if add_exit_status != 0:
-                        app.logger.warning(
-                            f"Job {job_id}: Failed to explicitly add PDFs: {add_error}, but continuing with existing zip"
-                        )
-                    else:
-                        app.logger.info(
-                            f"Job {job_id}: Successfully added PDFs to zip file"
-                        )
-            else:
-                app.logger.info(f"Job {job_id}: No PDF files found in {pdf_dir}")
-
-            # Download the zip file
-            sftp = ssh.open_sftp()
-            zip_path = f"{job_folder}/results.zip"
-
-            # Read zip file into memory
-            remote_file = sftp.open(zip_path, "rb")
-            zip_data = remote_file.read()
-            remote_file.close()
-            sftp.close()
-            # Don't close pooled connection - keep it for reuse
-        except paramiko.SSHException as ssh_err:
-            error_msg = str(ssh_err)
-            app.logger.error(f"SSH error during download for {job_id}: {error_msg}")
-            if "Authentication failed" in error_msg or "Anomalous request" in error_msg:
-                return (
-                    jsonify(
-                        {
-                            "error": "Authentication failed. Please wait a minute and try again.",
-                            "job_id": job_id,
-                        }
-                    ),
-                    429,
-                )
-            raise
+        # Read zip file into memory
+        remote_file = sftp.open(zip_path, "rb")
+        zip_data = remote_file.read()
+        remote_file.close()
+        sftp.close()
+        ssh.close()
 
         # Create Flask response with zip file
         response = make_response(zip_data)
@@ -3086,27 +2524,872 @@ def download_full_pipeline_results(job_id):
         return response
 
     except Exception as e:
-        error_msg = str(e)
         app.logger.error(
-            f"Error in download_full_pipeline_results for {job_id}: {error_msg}"
+            f"Error in download_full_pipeline_results for {job_id}: {str(e)}"
         )
+        return jsonify({"error": f"Failed to download results: {str(e)}"}), 500
+
+
+# ============================================================================
+# SCEPTER Model Endpoints
+# ============================================================================
+
+
+@app.route("/api/scepter/full-pipeline", methods=["OPTIONS", "POST"])
+@cross_origin()
+def submit_full_scepter_pipeline():
+    """
+    Submit a complete SCEPTER pipeline job.
+
+    Expected payload:
+    {
+        "coordinate": [lat, lon],  # Single coordinate point
+        "feedstock": "basalt" or "olivine",
+        "particle_size": 100, 320, 1220, or 3000,  # in µm
+        "application_rate": 1.0,  # t/ha/yr
+        "target_soil_ph": 7.0  # optional
+    }
+    """
+    if request.method == "OPTIONS":
+        origin = request.headers.get("Origin")
+        if origin and (origin in cors_origins or "localhost:5173" in origin):
+            response = make_response()
+            response.headers.add("Access-Control-Allow-Origin", origin)
+            response.headers.add("Access-Control-Allow-Methods", "POST, OPTIONS")
+            response.headers.add(
+                "Access-Control-Allow-Headers",
+                "Content-Type, ngrok-skip-browser-warning, Authorization, X-Requested-With",
+            )
+            response.headers.add("Access-Control-Allow-Credentials", "true")
+            return response, 200
+
+    try:
+        # Validate environment variables
+        if not os.getenv("GRACE_HOST"):
+            raise Exception("GRACE_HOST environment variable not set")
+        if not os.getenv("GRACE_USER"):
+            raise Exception("GRACE_USER environment variable not set")
+        if not os.getenv("SSH_PRIVATE_KEY"):
+            raise Exception("SSH_PRIVATE_KEY environment variable not set")
+
+        payload = request.get_json(silent=True) or {}
+        app.logger.debug(f"SCEPTER full pipeline request payload: {payload}")
+
+        # Extract parameters - SCEPTER uses single coordinate point
+        coordinate = payload.get("coordinate") or payload.get("coordinates")
+        if coordinate and isinstance(coordinate, list) and len(coordinate) == 2:
+            # Handle if coordinates is provided as single point
+            coordinate = coordinate
+        elif isinstance(coordinate, list) and len(coordinate) > 0:
+            # If multiple coordinates provided, take first one
+            coordinate = coordinate[0]
+        else:
+            return (
+                jsonify({"error": "A single coordinate [lat, lon] is required"}),
+                400,
+            )
+
+        # Validate coordinate
+        if not isinstance(coordinate, list) or len(coordinate) != 2:
+            return (
+                jsonify({"error": "Invalid coordinate format. Expected [lat, lon]"}),
+                400,
+            )
+        lat, lon = coordinate[0], coordinate[1]
+        if not isinstance(lat, (int, float)) or not isinstance(lon, (int, float)):
+            return (
+                jsonify({"error": "Latitude and longitude must be numbers"}),
+                400,
+            )
+        if lat < -90 or lat > 90 or lon < -180 or lon > 180:
+            return jsonify({"error": "Coordinates out of valid range"}), 400
+
+        # Extract SCEPTER-specific parameters
+        feedstock = payload.get("feedstock", "basalt")
+        particle_size = payload.get("particle_size")
+        application_rate = payload.get("application_rate")
+        target_soil_ph = payload.get("target_soil_ph")  # Optional
+
+        # Validate parameters
+        if feedstock not in ["basalt", "olivine"]:
+            return jsonify({"error": "feedstock must be 'basalt' or 'olivine'"}), 400
+
+        if particle_size is None:
+            return jsonify({"error": "particle_size is required"}), 400
+        particle_size = int(particle_size)
+        if particle_size not in [100, 320, 1220, 3000]:
+            return (
+                jsonify(
+                    {"error": "particle_size must be 100, 320, 1220, or 3000 (µm)"}
+                ),
+                400,
+            )
+
+        if application_rate is None:
+            return jsonify({"error": "application_rate is required"}), 400
+        application_rate = float(application_rate)
+        if application_rate <= 0:
+            return jsonify({"error": "application_rate must be positive"}), 400
+
+        if target_soil_ph is not None:
+            target_soil_ph = float(target_soil_ph)
+            if target_soil_ph < 0 or target_soil_ph > 14:
+                return (
+                    jsonify({"error": "target_soil_ph must be between 0 and 14"}),
+                    400,
+                )
+
+        # Generate unique job ID immediately
+        timestamp = int(time.time())
+        job_id = f"scepter_full_{timestamp}_{hash(str(coordinate)) % 10000}"
+        job_folder = f"/home/{GRACE_USER}/project/SCEPTER/jobs/{job_id}"
+        output_dir = f"{job_folder}/output"
+        scepter_path = f"/home/{GRACE_USER}/project/SCEPTER"
+
+        # Prepare parameters data
+        params_data = {
+            "coordinate": coordinate,
+            "feedstock": feedstock,
+            "particle_size": particle_size,
+            "application_rate": application_rate,
+        }
+        if target_soil_ph is not None:
+            params_data["target_soil_ph"] = target_soil_ph
+
+        # Cache job info immediately with "submitting" status
+        JOB_STATUS_CACHE[job_id] = {
+            "job_id": job_id,
+            "grace_job_id": None,  # Will be set after submission
+            "parameters": params_data,
+            "job_folder": job_folder,
+            "output_dir": output_dir,
+            "status": "submitting",  # Initial status
+            "submitted_at": time.time(),
+        }
+
+        # Start background thread to submit job
+        def submit_job_background():
+            """Submit job to Grace HPC in background"""
+            try:
+                app.logger.info(
+                    f"Starting background submission for SCEPTER job {job_id}"
+                )
+
+                # Connect to Grace via SSH
+                ssh = get_ssh_connection()
+
+                # Create job folder and write parameters
+                params_json = json.dumps(params_data, indent=2)
+
+                commands = [
+                    f"mkdir -p {job_folder}",
+                    f"mkdir -p {output_dir}",
+                    f"echo '{params_json}' > {job_folder}/parameters.json",
+                ]
+
+                for cmd in commands:
+                    stdin, stdout, stderr = ssh.exec_command(cmd)
+                    exit_status = stdout.channel.recv_exit_status()
+                    if exit_status != 0:
+                        error_msg = stderr.read().decode()
+                        ssh.close()
+                        # Update cache with error
+                        JOB_STATUS_CACHE[job_id].update(
+                            {
+                                "status": "failed",
+                                "error": f"Failed to setup job folder: {error_msg}",
+                            }
+                        )
+                        return
+
+                # Prepare values for bash script
+                target_ph_value = (
+                    str(target_soil_ph) if target_soil_ph is not None else "NONE"
+                )
+                target_ph_display = (
+                    str(target_soil_ph)
+                    if target_soil_ph is not None
+                    else "Not specified"
+                )
+
+                # Create SLURM job script for SCEPTER Fortran model
+                sbatch_script = f"""#!/bin/bash
+#SBATCH --job-name=scepter_full_{job_id[:12]}
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=24:00:00
+#SBATCH --output={job_folder}/%x_%j.out
+#SBATCH --error={job_folder}/%x_%j.err
+
+set -x  # Print commands for debugging
+
+# Navigate to SCEPTER directory
+if ! cd {scepter_path}; then
+    echo "ERROR: Cannot find directory {scepter_path}"
+    exit 1
+fi
+
+echo "Working directory: $(pwd)"
+
+# Load Fortran compiler module if available
+if module avail GCC 2>&1 | grep -q "GCC/"; then
+    module load GCC/12.2.0 2>&1 || module load GCC 2>&1 || echo "Warning: Could not load GCC module"
+fi
+
+# Check for Fortran compiler
+if ! command -v gfortran &> /dev/null && ! command -v ifort &> /dev/null; then
+    echo "ERROR: Fortran compiler (gfortran or ifort) not found"
+    exit 1
+fi
+
+# Write input parameters to file for Fortran program
+# Format: lat, lon, feedstock, particle_size, application_rate, target_soil_ph
+INPUT_FILE="{job_folder}/scepter_input.txt"
+echo "{lat} {lon} {feedstock} {particle_size} {application_rate} {target_ph_value}" > $INPUT_FILE
+
+echo "=========================================="
+echo "SCEPTER Model Run"
+echo "=========================================="
+echo "Input parameters:"
+echo "  Coordinate: [{lat}, {lon}]"
+echo "  Feedstock: {feedstock}"
+echo "  Particle Size: {particle_size} µm"
+echo "  Application Rate: {application_rate} t/ha/yr"
+echo "  Target Soil pH: {target_ph_display}"
+echo "=========================================="
+
+# Run SCEPTER Fortran executable
+# Adjust executable name and path based on actual SCEPTER setup
+SCEPTER_EXEC="scepter"  # Update with actual executable name
+if [ -f "$SCEPTER_EXEC" ]; then
+    ./$SCEPTER_EXEC < $INPUT_FILE > {output_dir}/scepter_output.txt 2>&1
+    EXIT_CODE=$?
+elif [ -f "bin/$SCEPTER_EXEC" ]; then
+    ./bin/$SCEPTER_EXEC < $INPUT_FILE > {output_dir}/scepter_output.txt 2>&1
+    EXIT_CODE=$?
+elif [ -f "build/$SCEPTER_EXEC" ]; then
+    ./build/$SCEPTER_EXEC < $INPUT_FILE > {output_dir}/scepter_output.txt 2>&1
+    EXIT_CODE=$?
+else
+    echo "ERROR: SCEPTER executable not found. Please check the executable name and location."
+    exit 1
+fi
+
+if [ $EXIT_CODE -ne 0 ]; then
+    echo "ERROR: SCEPTER model run failed with exit code $EXIT_CODE"
+    exit 1
+fi
+
+# Move results to output directory if needed
+# Adjust based on where SCEPTER writes its output files
+if [ -d "output" ]; then
+    cp -r output/* {output_dir}/ 2>/dev/null || true
+fi
+
+# Create completion marker
+echo "Job completed at $(date)" > {job_folder}/.completed
+echo "=========================================="
+echo "SCEPTER pipeline completed successfully!"
+echo "Results saved to: {output_dir}"
+echo "=========================================="
+"""
+
+                # Write SLURM script to Grace
+                script_path = f"{job_folder}/job.sh"
+                stdin, stdout, stderr = ssh.exec_command(
+                    f"cat > {script_path} << 'SCRIPT_EOF'\n{sbatch_script}\nSCRIPT_EOF"
+                )
+                exit_status = stdout.channel.recv_exit_status()
+                if exit_status != 0:
+                    error_msg = stderr.read().decode()
+                    ssh.close()
+                    # Update cache with error
+                    JOB_STATUS_CACHE[job_id].update(
+                        {
+                            "status": "failed",
+                            "error": f"Failed to write job script: {error_msg}",
+                        }
+                    )
+                    return
+
+                # Make script executable
+                stdin, stdout, stderr = ssh.exec_command(f"chmod +x {script_path}")
+                exit_status = stdout.channel.recv_exit_status()
+
+                # Submit SLURM job
+                sbatch_cmd = f"sbatch {script_path}"
+                stdin, stdout, stderr = ssh.exec_command(sbatch_cmd)
+                result = stdout.read().decode().strip()
+                error = stderr.read().decode().strip()
+                exit_status = stdout.channel.recv_exit_status()
+
+                ssh.close()
+
+                if exit_status == 0 and "Submitted batch job" in result:
+                    # Extract Grace job ID from sbatch output
+                    grace_job_id = result.split()[-1]
+
+                    # Update cache with submitted status
+                    JOB_STATUS_CACHE[job_id].update(
+                        {
+                            "grace_job_id": grace_job_id,
+                            "status": "submitted",
+                        }
+                    )
+                    app.logger.info(
+                        f"SCEPTER job {job_id} submitted successfully with Grace job ID {grace_job_id}"
+                    )
+                else:
+                    # Update cache with failed status
+                    JOB_STATUS_CACHE[job_id].update(
+                        {
+                            "status": "failed",
+                            "error": f"Failed to submit job: {error}",
+                        }
+                    )
+                    app.logger.error(f"SCEPTER job {job_id} submission failed: {error}")
+            except Exception as e:
+                import traceback
+
+                error_traceback = traceback.format_exc()
+                app.logger.error(
+                    f"Error in background submission for SCEPTER job {job_id}: {str(e)}"
+                )
+                app.logger.error(f"Traceback: {error_traceback}")
+                # Update cache with error status
+                JOB_STATUS_CACHE[job_id].update(
+                    {
+                        "status": "failed",
+                        "error": f"Backend error: {str(e)}",
+                    }
+                )
+
+        # Start background thread
+        thread = threading.Thread(target=submit_job_background, daemon=True)
+        thread.start()
+
+        # Return immediately with job_id
+        return jsonify(
+            {
+                "job_id": job_id,
+                "grace_job_id": None,  # Will be set after submission
+                "status": "submitting",  # Initial status
+                "message": f"SCEPTER full pipeline job is being submitted. Job ID: {job_id}. Check status endpoint for updates.",
+                "parameters": params_data,
+            }
+        )
+
+    except Exception as e:
         import traceback
 
-        app.logger.error(f"Traceback: {traceback.format_exc()}")
+        error_traceback = traceback.format_exc()
+        app.logger.error(f"Error in submit_full_scepter_pipeline: {str(e)}")
+        app.logger.error(f"Traceback: {error_traceback}")
 
-        # Check for authentication-related errors
-        if "Authentication failed" in error_msg or "Anomalous request" in error_msg:
+        error_response = jsonify(
+            {
+                "error": f"Backend error: {str(e)}",
+                "details": error_traceback if app.debug else None,
+            }
+        )
+        origin = request.headers.get("Origin")
+        if origin and (origin in cors_origins or "localhost:5173" in origin):
+            error_response.headers.add("Access-Control-Allow-Origin", origin)
+            error_response.headers.add("Access-Control-Allow-Credentials", "true")
+        return error_response, 500
+
+
+@app.route("/api/scepter/full-pipeline/<job_id>/status", methods=["GET", "OPTIONS"])
+@cross_origin()
+def check_full_scepter_pipeline_status(job_id):
+    """Check the status of a full SCEPTER pipeline job"""
+    # Handle preflight OPTIONS request
+    if request.method == "OPTIONS":
+        response = make_response()
+        origin = request.headers.get("Origin")
+        if origin and (
+            origin in cors_origins or "netlify.app" in origin or "localhost" in origin
+        ):
+            response.headers.add("Access-Control-Allow-Origin", origin)
+        else:
+            response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add("Access-Control-Allow-Methods", "GET, OPTIONS")
+        response.headers.add(
+            "Access-Control-Allow-Headers",
+            "Content-Type, ngrok-skip-browser-warning, Authorization, X-Requested-With",
+        )
+        response.headers.add("Access-Control-Max-Age", "3600")
+        return response
+    try:
+        # Get cached job info
+        job_info = JOB_STATUS_CACHE.get(job_id, {})
+
+        # Check if job already failed (from background thread)
+        if job_info.get("status") == "failed":
             return (
                 jsonify(
                     {
-                        "error": "Authentication failed. Please wait a minute and try again. Too many connection attempts may trigger security measures.",
                         "job_id": job_id,
+                        "status": "failed",
+                        "error": job_info.get("error", "Job submission failed"),
+                        "message": "Job submission failed. Check backend logs for details.",
                     }
                 ),
-                429,  # Too Many Requests
+                500,
             )
 
-        return jsonify({"error": f"Failed to download results: {error_msg}"}), 500
+        grace_job_id = job_info.get("grace_job_id")
+        job_folder = job_info.get(
+            "job_folder", f"/home/{GRACE_USER}/project/SCEPTER/jobs/{job_id}"
+        )
+        submitted_at = job_info.get("submitted_at", time.time())
+        time_elapsed = time.time() - submitted_at
+
+        # Connect to Grace via SSH
+        try:
+            ssh = get_ssh_connection()
+        except Exception as ssh_error:
+            app.logger.error(
+                f"SSH connection failed for SCEPTER job {job_id}: {str(ssh_error)}"
+            )
+            # If still within submission window, return submitting status
+            if time_elapsed < 300:
+                return jsonify(
+                    {
+                        "job_id": job_id,
+                        "status": "submitting",
+                        "message": "Job is being submitted to Grace HPC. Please wait...",
+                    }
+                )
+            else:
+                return (
+                    jsonify(
+                        {
+                            "job_id": job_id,
+                            "status": "unknown",
+                            "error": f"Failed to connect to Grace HPC: {str(ssh_error)}",
+                            "message": "Unable to check job status. Please try again later.",
+                        }
+                    ),
+                    500,
+                )
+
+        # If job not in cache or grace_job_id is None, try to recover by checking if job folder exists
+        if not grace_job_id:
+            # Check if job folder exists on Grace
+            check_folder_cmd = (
+                f"test -d {job_folder} && echo 'exists' || echo 'not_found'"
+            )
+            stdin, stdout, stderr = ssh.exec_command(check_folder_cmd)
+            folder_exists = stdout.read().decode().strip()
+
+            if folder_exists == "not_found":
+                # Folder doesn't exist yet - check if still within submission window
+                if time_elapsed < 300:  # Less than 5 minutes
+                    ssh.close()
+                    return jsonify(
+                        {
+                            "job_id": job_id,
+                            "grace_job_id": None,
+                            "status": "submitting",
+                            "message": "Job is being submitted to Grace HPC. Please wait...",
+                        }
+                    )
+                else:
+                    # Submission timeout
+                    ssh.close()
+                    return (
+                        jsonify(
+                            {
+                                "error": "Job not found. The job may have been cleared or never submitted.",
+                                "job_id": job_id,
+                            }
+                        ),
+                        404,
+                    )
+
+            # Try to find grace_job_id from log files
+            find_job_id_cmd = f"grep -h 'Submitted batch job' {job_folder}/*.out 2>/dev/null | tail -1 | awk '{{print $NF}}'"
+            stdin, stdout, stderr = ssh.exec_command(find_job_id_cmd)
+            recovered_job_id = stdout.read().decode().strip()
+
+            if recovered_job_id:
+                grace_job_id = recovered_job_id
+                # Reconstruct job_info and cache it
+                job_info = {
+                    "job_id": job_id,
+                    "grace_job_id": grace_job_id,
+                    "job_folder": job_folder,
+                }
+                JOB_STATUS_CACHE[job_id] = job_info
+                app.logger.info(
+                    f"Recovered SCEPTER job {job_id} with grace_job_id {grace_job_id}"
+                )
+            else:
+                # Job folder exists but no job_id found - check completion status first
+                check_completion_cmd = f"test -f {job_folder}/.completed && echo 'completed' || echo 'unknown'"
+                stdin, stdout, stderr = ssh.exec_command(check_completion_cmd)
+                completion_status = stdout.read().decode().strip()
+
+                if completion_status == "completed":
+                    ssh.close()
+                    return jsonify(
+                        {
+                            "job_id": job_id,
+                            "status": "completed",
+                            "message": "Job completed (recovered from Grace filesystem)",
+                        }
+                    )
+                else:
+                    # Job folder exists but no job_id and not completed
+                    # Check if still within submission window
+                    if time_elapsed < 300:  # Less than 5 minutes
+                        # Still submitting - SLURM job hasn't been submitted yet
+                        ssh.close()
+                        return jsonify(
+                            {
+                                "job_id": job_id,
+                                "grace_job_id": None,
+                                "status": "submitting",
+                                "message": "Job is being submitted to Grace HPC. Please wait...",
+                            }
+                        )
+                    else:
+                        # Submission timeout - something went wrong
+                        ssh.close()
+                        return (
+                            jsonify(
+                                {
+                                    "error": "Job found on Grace but status cannot be determined. The job may be in an unknown state.",
+                                    "job_id": job_id,
+                                }
+                            ),
+                            500,
+                        )
+
+        # Ensure grace_job_id is not None before checking SLURM
+        if not grace_job_id:
+            ssh.close()
+            return jsonify(
+                {
+                    "job_id": job_id,
+                    "grace_job_id": None,
+                    "status": "submitting",
+                    "message": "Job is being submitted to Grace HPC. Please wait...",
+                }
+            )
+
+        job_folder = job_info.get(
+            "job_folder", f"/home/{GRACE_USER}/project/SCEPTER/jobs/{job_id}"
+        )
+        cached_status = job_info.get("status")
+
+        # Check SLURM job status
+        squeue_cmd = f"squeue -j {grace_job_id} --format='%T' --noheader"
+        stdin, stdout, stderr = ssh.exec_command(squeue_cmd)
+        slurm_status_raw = stdout.read().decode().strip()
+        slurm_status = slurm_status_raw.split("\n")[0] if slurm_status_raw else ""
+
+        # Map SLURM status
+        status_map = {
+            "PENDING": "pending",
+            "RUNNING": "running",
+            "COMPLETED": "completed",
+            "FAILED": "failed",
+            "CANCELLED": "failed",
+            "TIMEOUT": "failed",
+        }
+
+        if slurm_status:
+            # Job found in queue
+            status = status_map.get(slurm_status, "unknown")
+            # If status is unknown from SLURM, check if job actually completed
+            if status == "unknown":
+                check_cmd = f"test -f {job_folder}/.completed && echo 'completed' || echo 'unknown'"
+                stdin, stdout, stderr = ssh.exec_command(check_cmd)
+                output_check = stdout.read().decode().strip()
+                if output_check == "completed":
+                    status = "completed"
+        else:
+            # Job not in queue - check if it was just submitted
+            if cached_status == "submitted":
+                # Job was just submitted but not in queue yet - check sacct
+                sacct_cmd = f"sacct -j {grace_job_id} --format=State --noheader --parsable2 2>/dev/null | head -1 | cut -d'|' -f1"
+                stdin2, stdout2, stderr2 = ssh.exec_command(sacct_cmd)
+                sacct_status = stdout2.read().decode().strip()
+
+                if sacct_status:
+                    # Job found in sacct - use that status
+                    status = status_map.get(sacct_status, "submitted")
+                else:
+                    # Job not found in either - still transitioning, return "submitted"
+                    status = "submitted"
+            else:
+                # Job not in queue and wasn't just submitted - check completion marker and log files
+                check_cmd = f"test -f {job_folder}/.completed && echo 'completed' || (test -f {job_folder}/*.out && echo 'running' || echo 'unknown')"
+                stdin, stdout, stderr = ssh.exec_command(check_cmd)
+                output_check = stdout.read().decode().strip()
+                if output_check == "completed":
+                    status = "completed"
+                elif output_check == "running":
+                    # Check log files to see if job is actually running
+                    log_check = f"tail -n 5 {job_folder}/*.out 2>/dev/null | grep -q 'Step' && echo 'running' || echo 'unknown'"
+                    stdin2, stdout2, stderr2 = ssh.exec_command(log_check)
+                    log_output = stdout2.read().decode().strip()
+                    status = "running" if log_output == "running" else "unknown"
+                else:
+                    status = "unknown"
+
+        # Get latest log output and detect current step
+        logs = []
+        current_step = None
+        step_progress = None
+
+        if status in ["running", "completed", "failed"]:
+            log_cmd = f"tail -n 100 {job_folder}/*.out 2>/dev/null || echo 'No log file found'"
+            stdin, stdout, stderr = ssh.exec_command(log_cmd)
+            log_content = stdout.read().decode()
+            if log_content:
+                logs = log_content.split("\n")[-20:]  # Last 20 lines
+
+                # Parse logs to detect current step
+                all_logs = log_content.split("\n")
+                latest_step = 0
+
+                for log_line in reversed(all_logs):
+                    # Look for "Step X:" pattern
+                    step_match = re.search(r"Step\s+(\d+):\s*(.+)", log_line)
+                    if step_match:
+                        step_num = int(step_match.group(1))
+                        if step_num > latest_step:
+                            latest_step = step_num
+                            step_name = step_match.group(2).strip()
+                            # Check if step completed
+                            if "completed successfully" in log_content:
+                                current_step = (
+                                    f"Step {step_num}: {step_name} (Completed)"
+                                )
+                                step_progress = {
+                                    "step": step_num,
+                                    "name": step_name,
+                                    "status": "completed",
+                                }
+                            elif "ERROR" in log_line:
+                                # Step failed
+                                current_step = f"Step {step_num}: {step_name} (Failed)"
+                                step_progress = {
+                                    "step": step_num,
+                                    "name": step_name,
+                                    "status": "failed",
+                                }
+                            else:
+                                # Step is currently running
+                                current_step = f"Step {step_num}: {step_name}"
+                                step_progress = {
+                                    "step": step_num,
+                                    "name": step_name,
+                                    "status": "running",
+                                }
+                            break
+
+                # If no step found but job is running, default to Step 1
+                if not current_step and status == "running":
+                    current_step = "Step 1: Site Selection"
+                    step_progress = {
+                        "step": 1,
+                        "name": "Site Selection",
+                        "status": "running",
+                    }
+
+        # Update cache
+        job_info["status"] = status
+        if current_step:
+            job_info["current_step"] = current_step
+        if step_progress:
+            job_info["step_progress"] = step_progress
+        JOB_STATUS_CACHE[job_id] = job_info
+
+        ssh.close()
+
+        return jsonify(
+            {
+                "job_id": job_id,
+                "grace_job_id": grace_job_id,
+                "status": status,
+                "submitted_at": job_info.get("submitted_at"),
+                "logs": logs,
+                "current_step": current_step,
+                "step_progress": step_progress,
+            }
+        )
+
+    except Exception as e:
+        app.logger.error(
+            f"Error in check_full_scepter_pipeline_status for {job_id}: {str(e)}"
+        )
+        return (
+            jsonify(
+                {
+                    "job_id": job_id,
+                    "status": "unknown",
+                    "error": f"Status check failed: {str(e)}",
+                }
+            ),
+            500,
+        )
+
+
+@app.route("/api/scepter/full-pipeline/<job_id>/results", methods=["GET", "OPTIONS"])
+@cross_origin()
+def get_full_scepter_pipeline_results(job_id):
+    """Get the results of a completed full SCEPTER pipeline job"""
+    # Handle preflight OPTIONS request
+    if request.method == "OPTIONS":
+        response = make_response()
+        origin = request.headers.get("Origin")
+        if origin and (
+            origin in cors_origins or "netlify.app" in origin or "localhost" in origin
+        ):
+            response.headers.add("Access-Control-Allow-Origin", origin)
+        else:
+            response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add("Access-Control-Allow-Methods", "GET, OPTIONS")
+        response.headers.add(
+            "Access-Control-Allow-Headers",
+            "Content-Type, ngrok-skip-browser-warning, Authorization, X-Requested-With",
+        )
+        response.headers.add("Access-Control-Max-Age", "3600")
+        return response
+    try:
+        # Get cached job info
+        job_info = JOB_STATUS_CACHE.get(job_id, {})
+        job_folder = job_info.get(
+            "job_folder", f"/home/{GRACE_USER}/project/SCEPTER/jobs/{job_id}"
+        )
+        output_dir = job_info.get("output_dir", f"{job_folder}/output")
+
+        # Connect to Grace via SSH
+        ssh = get_ssh_connection()
+
+        # Allow access to results even if job is still running
+        # SCEPTER outputs results to an output folder (no PDFs or shapefiles)
+        results = {}
+
+        # Check job completion status
+        check_cmd = (
+            f"test -f {job_folder}/.completed && echo 'completed' || echo 'running'"
+        )
+        stdin, stdout, stderr = ssh.exec_command(check_cmd)
+        job_status = stdout.read().decode().strip()
+
+        # List all files in the output directory
+        list_cmd = f"find {output_dir} -type f 2>/dev/null | head -50"
+        stdin, stdout, stderr = ssh.exec_command(list_cmd)
+        output_files = stdout.read().decode().strip().split("\n")
+        output_files = [f for f in output_files if f]  # Remove empty strings
+
+        # Get directory structure
+        tree_cmd = f"ls -la {output_dir} 2>/dev/null || echo ''"
+        stdin, stdout, stderr = ssh.exec_command(tree_cmd)
+        directory_listing = stdout.read().decode().strip()
+
+        results["status"] = job_status
+        results["output_directory"] = output_dir
+        results["files"] = output_files
+        results["file_count"] = len(output_files)
+
+        if job_status == "completed":
+            results["message"] = (
+                "Job completed. Results are available in the output folder. Use download endpoint to retrieve all files."
+            )
+        else:
+            results["message"] = (
+                "Job is still running. Partial results may be available in the output folder."
+            )
+
+        ssh.close()
+
+        return jsonify(
+            {
+                "job_id": job_id,
+                "status": job_status,
+                "results": results,
+            }
+        )
+
+    except Exception as e:
+        app.logger.error(
+            f"Error in get_full_scepter_pipeline_results for {job_id}: {str(e)}"
+        )
+        return jsonify({"error": f"Failed to retrieve results: {str(e)}"}), 500
+
+
+@app.route("/api/scepter/full-pipeline/<job_id>/download", methods=["GET", "OPTIONS"])
+@cross_origin()
+def download_full_scepter_pipeline_results(job_id):
+    # Handle preflight OPTIONS request
+    if request.method == "OPTIONS":
+        response = make_response()
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add(
+            "Access-Control-Allow-Headers",
+            "Content-Type, ngrok-skip-browser-warning, Authorization, X-Requested-With",
+        )
+        response.headers.add("Access-Control-Allow-Methods", "GET, OPTIONS")
+        response.headers.add("Access-Control-Max-Age", "3600")
+        return response
+    """Download results as a zip file"""
+    try:
+        import zipfile
+        import tempfile
+        import io
+
+        job_info = JOB_STATUS_CACHE.get(job_id, {})
+        job_folder = job_info.get(
+            "job_folder", f"/home/{GRACE_USER}/project/SCEPTER/jobs/{job_id}"
+        )
+        output_dir = job_info.get("output_dir", f"{job_folder}/output")
+
+        # Connect to Grace via SSH
+        ssh = get_ssh_connection()
+
+        # Allow download even if job is still running (downloads whatever is available)
+        # Create a zip file on Grace and download it
+        zip_cmd = f"cd {job_folder} && zip -r results.zip output/ 2>&1"
+        stdin, stdout, stderr = ssh.exec_command(zip_cmd)
+        exit_status = stdout.channel.recv_exit_status()
+
+        if exit_status != 0:
+            error_msg = stderr.read().decode()
+            ssh.close()
+            return jsonify({"error": f"Failed to create zip: {error_msg}"}), 500
+
+        # Download the zip file
+        sftp = ssh.open_sftp()
+        zip_path = f"{job_folder}/results.zip"
+
+        # Read zip file into memory
+        remote_file = sftp.open(zip_path, "rb")
+        zip_data = remote_file.read()
+        remote_file.close()
+        sftp.close()
+        ssh.close()
+
+        # Create Flask response with zip file
+        response = make_response(zip_data)
+        response.headers["Content-Type"] = "application/zip"
+        response.headers["Content-Disposition"] = (
+            f"attachment; filename=scepter_results_{job_id}.zip"
+        )
+
+        return response
+
+    except Exception as e:
+        app.logger.error(
+            f"Error in download_full_scepter_pipeline_results for {job_id}: {str(e)}"
+        )
+        return jsonify({"error": f"Failed to download results: {str(e)}"}), 500
 
 
 if __name__ == "__main__":

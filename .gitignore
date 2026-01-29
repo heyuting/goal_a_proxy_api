@@ -111,4 +111,7 @@ dmypy.json
 
 # OS
 .DS_Store
-Thumbs.db 
+Thumbs.db
+
+# Large shapefiles (exceed GitHub 100MB limit; keep locally or use Git LFS)
+input/shp/
