@@ -1,6 +1,7 @@
 """
 DRN blueprint: run-job, check-job-status, full-pipeline, watershed, outlet compatibility.
 """
+
 from flask import Blueprint, request, jsonify, make_response, current_app
 from flask_cors import cross_origin
 import subprocess
@@ -17,6 +18,7 @@ JOB_STATUS_CACHE = {}  # In production, use Redis or database
 
 # Project root (parent of blueprints/) for finding scripts like 01_site_selection.py
 _DRN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
 
 @drn_bp.route("/api/run-job", methods=["POST"])
 def run_job():
@@ -289,7 +291,10 @@ def submit_full_drn_pipeline():
     """
     if request.method == "OPTIONS":
         origin = request.headers.get("Origin")
-        if origin and (origin in current_app.config.get('CORS_ORIGINS', []) or "localhost:5173" in origin):
+        if origin and (
+            origin in current_app.config.get("CORS_ORIGINS", [])
+            or "localhost:5173" in origin
+        ):
             response = make_response()
             response.headers.add("Access-Control-Allow-Origin", origin)
             response.headers.add("Access-Control-Allow-Methods", "POST, OPTIONS")
@@ -395,22 +400,25 @@ def submit_full_drn_pipeline():
         def submit_job_background():
             """Submit job to Grace HPC in background"""
             from app import app
+
             with app.app_context():
                 try:
-                    current_app.logger.info(f"Starting background submission for job {job_id}")
+                    current_app.logger.info(
+                        f"Starting background submission for job {job_id}"
+                    )
 
                     # Connect to Grace via SSH
                     ssh = get_ssh_connection()
-    
+
                     # Create job folder and write parameters
                     params_json = json.dumps(params_data, indent=2)
-    
+
                     commands = [
                         f"mkdir -p {job_folder}",
                         f"mkdir -p {output_dir}",
                         f"echo '{params_json}' > {job_folder}/parameters.json",
                     ]
-    
+
                     for cmd in commands:
                         stdin, stdout, stderr = ssh.exec_command(cmd)
                         exit_status = stdout.channel.recv_exit_status()
@@ -425,11 +433,11 @@ def submit_full_drn_pipeline():
                                 }
                             )
                             return
-    
+
                     # Create SLURM job script for full pipeline
                     # Use 32G to improve schedulability when Grace is busy (was 64G)
                     sbatch_script = f"""#!/bin/bash
-    #SBATCH --job-name=drn_full_{job_id[:5]}
+    #SBATCH --job-name={job_id[:12]}
     #SBATCH --ntasks=1
     #SBATCH --cpus-per-task=8
     #SBATCH --mem=32G
@@ -569,7 +577,7 @@ def submit_full_drn_pipeline():
     """
                     # SLURM requires #SBATCH at column 1; strip Python indentation
                     sbatch_script = sbatch_script.replace("\n    ", "\n")
-    
+
                     # Write SLURM script to Grace
                     script_path = f"{job_folder}/job.sh"
                     stdin, stdout, stderr = ssh.exec_command(
@@ -587,22 +595,22 @@ def submit_full_drn_pipeline():
                             }
                         )
                         return
-    
+
                     # Make script executable
                     stdin, stdout, stderr = ssh.exec_command(f"chmod +x {script_path}")
                     exit_status = stdout.channel.recv_exit_status()
-    
+
                     # Submit SLURM job
                     sbatch_cmd = f"sbatch {script_path}"
                     stdin, stdout, stderr = ssh.exec_command(sbatch_cmd)
                     result = stdout.read().decode().strip()
                     error = stderr.read().decode().strip()
                     exit_status = stdout.channel.recv_exit_status()
-    
+
                     if exit_status == 0 and "Submitted batch job" in result:
                         # Extract Grace job ID from sbatch output
                         grace_job_id = result.split()[-1]
-    
+
                         # Save grace_job_id to a file in the job folder for persistence
                         # This ensures we can recover it even if the server restarts
                         try:
@@ -623,10 +631,10 @@ def submit_full_drn_pipeline():
                             current_app.logger.warning(
                                 f"Error saving grace_job_id to file: {str(save_error)}"
                             )
-    
+
                         # Close SSH connection after saving grace_job_id
                         ssh.close()
-    
+
                         # Update cache with submitted status
                         JOB_STATUS_CACHE[job_id].update(
                             {
@@ -647,7 +655,9 @@ def submit_full_drn_pipeline():
                                 "error": f"Failed to submit job: {error}",
                             }
                         )
-                        current_app.logger.error(f"Job {job_id} submission failed: {error}")
+                        current_app.logger.error(
+                            f"Job {job_id} submission failed: {error}"
+                        )
                         # Check if error is related to disk quota
                         if "quota" in error.lower() or "disk" in error.lower():
                             JOB_STATUS_CACHE[job_id].update(
@@ -659,7 +669,12 @@ def submit_full_drn_pipeline():
                         # Check if error is related to memory / resources (Grace out of memory)
                         elif any(
                             x in error.lower()
-                            for x in ("memory", "insufficient", "resources", "reason=none")
+                            for x in (
+                                "memory",
+                                "insufficient",
+                                "resources",
+                                "reason=none",
+                            )
                         ):
                             JOB_STATUS_CACHE[job_id].update(
                                 {
@@ -669,34 +684,32 @@ def submit_full_drn_pipeline():
                             )
                 except Exception as e:
                     import traceback
-    
+
                     error_traceback = traceback.format_exc()
                     error_msg = str(e)
                     current_app.logger.error(
                         f"Error in background submission for job {job_id}: {error_msg}"
                     )
                     current_app.logger.error(f"Traceback: {error_traceback}")
-    
+
                     # Close SSH connection if it exists
                     try:
                         if "ssh" in locals() and ssh:
                             ssh.close()
                     except:
                         pass
-    
+
                     # Check if error is related to disk quota
                     if "quota" in error_msg.lower() or "disk" in error_msg.lower():
-                        error_msg = (
-                            f"Disk quota issue: {error_msg}. Please clean up old job files."
-                        )
-    
+                        error_msg = f"Disk quota issue: {error_msg}. Please clean up old job files."
+
                     # Update cache with error status
                     JOB_STATUS_CACHE[job_id].update(
                         {
                             "status": "failed",
                             "error": f"Backend error: {error_msg}",
-                    }
-                )
+                        }
+                    )
 
         # Start background thread
         thread = threading.Thread(target=submit_job_background, daemon=True)
@@ -727,7 +740,10 @@ def submit_full_drn_pipeline():
             }
         )
         origin = request.headers.get("Origin")
-        if origin and (origin in current_app.config.get('CORS_ORIGINS', []) or "localhost:5173" in origin):
+        if origin and (
+            origin in current_app.config.get("CORS_ORIGINS", [])
+            or "localhost:5173" in origin
+        ):
             error_response.headers.add("Access-Control-Allow-Origin", origin)
             error_response.headers.add("Access-Control-Allow-Credentials", "true")
         return error_response, 500
@@ -743,7 +759,9 @@ def check_full_pipeline_status(job_id):
         origin = request.headers.get("Origin")
         # Allow the origin if it's in our allowed list or is a Netlify domain
         if origin and (
-            origin in current_app.config.get('CORS_ORIGINS', []) or "netlify.app" in origin or "localhost" in origin
+            origin in current_app.config.get("CORS_ORIGINS", [])
+            or "netlify.app" in origin
+            or "localhost" in origin
         ):
             response.headers.add("Access-Control-Allow-Origin", origin)
         else:
@@ -758,7 +776,7 @@ def check_full_pipeline_status(job_id):
     try:
         # Get cached job info
         job_info = JOB_STATUS_CACHE.get(job_id, {})
-        
+
         # Log cache state for debugging
         if not job_info:
             current_app.logger.warning(
@@ -936,10 +954,18 @@ def check_full_pipeline_status(job_id):
                     "job_id": job_id,
                     "grace_job_id": grace_job_id,
                     "job_folder": job_folder,
-                    "submitted_at": existing_job_info.get("submitted_at", time.time()),  # Preserve submitted_at
-                    "status": existing_job_info.get("status", "submitted"),  # Preserve status
-                    "parameters": existing_job_info.get("parameters"),  # Preserve parameters
-                    "output_dir": existing_job_info.get("output_dir"),  # Preserve output_dir
+                    "submitted_at": existing_job_info.get(
+                        "submitted_at", time.time()
+                    ),  # Preserve submitted_at
+                    "status": existing_job_info.get(
+                        "status", "submitted"
+                    ),  # Preserve status
+                    "parameters": existing_job_info.get(
+                        "parameters"
+                    ),  # Preserve parameters
+                    "output_dir": existing_job_info.get(
+                        "output_dir"
+                    ),  # Preserve output_dir
                 }
                 JOB_STATUS_CACHE[job_id] = job_info
                 current_app.logger.info(
@@ -1122,7 +1148,7 @@ def check_full_pipeline_status(job_id):
             stdin, stdout, stderr = ssh.exec_command(squeue_cmd)
             slurm_status_raw = stdout.read().decode().strip()
             slurm_status = slurm_status_raw.split("\n")[0] if slurm_status_raw else ""
-            
+
             if slurm_status:
                 # Job is already in queue, use SLURM status (don't go back to "submitted")
                 status_map = {
@@ -1149,7 +1175,7 @@ def check_full_pipeline_status(job_id):
                 current_app.logger.info(
                     f"[Status Check] Job {job_id} - Not in SLURM queue yet, returning 'submitted' status"
                 )
-            
+
             # Return immediately with current status
             return jsonify(
                 {
@@ -1158,10 +1184,14 @@ def check_full_pipeline_status(job_id):
                     "status": status,
                     "submitted_at": submitted_at,
                     "logs": [],
-                    "message": f"Job submitted successfully to Grace HPC with job ID {grace_job_id}" if status == "submitted" else None,
+                    "message": (
+                        f"Job submitted successfully to Grace HPC with job ID {grace_job_id}"
+                        if status == "submitted"
+                        else None
+                    ),
                 }
             )
-        
+
         # If cached status is already "running", "pending", or "completed", don't override it
         # Continue with normal SLURM checking logic below
         if grace_job_id and cached_status in ["running", "pending", "completed"]:
@@ -1171,7 +1201,9 @@ def check_full_pipeline_status(job_id):
 
         # Ensure grace_job_id is valid before using it
         if not grace_job_id or not isinstance(grace_job_id, str):
-            current_app.logger.warning(f"Invalid grace_job_id for job {job_id}: {grace_job_id}")
+            current_app.logger.warning(
+                f"Invalid grace_job_id for job {job_id}: {grace_job_id}"
+            )
             # Check if job is completed before assuming it's still submitting
             check_completion_cmd = f"test -f {job_folder}/.completed && echo 'completed' || echo 'not_completed'"
             stdin, stdout, stderr = ssh.exec_command(check_completion_cmd)
@@ -1404,9 +1436,7 @@ def check_full_pipeline_status(job_id):
             if not error_message and any(
                 ind in all_log_lower for ind in oom_indicators
             ):
-                oom_found = next(
-                    ind for ind in oom_indicators if ind in all_log_lower
-                )
+                oom_found = next(ind for ind in oom_indicators if ind in all_log_lower)
                 if status == "completed":
                     status = "failed"
                 error_message = (
@@ -1555,7 +1585,9 @@ def check_full_pipeline_status(job_id):
         import traceback
 
         error_traceback = traceback.format_exc()
-        current_app.logger.error(f"Error in check_full_pipeline_status for {job_id}: {str(e)}")
+        current_app.logger.error(
+            f"Error in check_full_pipeline_status for {job_id}: {str(e)}"
+        )
         current_app.logger.error(f"Traceback: {error_traceback}")
         return (
             jsonify(
@@ -1580,7 +1612,9 @@ def get_full_pipeline_results(job_id):
         origin = request.headers.get("Origin")
         # Allow the origin if it's in our allowed list or is a Netlify domain
         if origin and (
-            origin in current_app.config.get('CORS_ORIGINS', []) or "netlify.app" in origin or "localhost" in origin
+            origin in current_app.config.get("CORS_ORIGINS", [])
+            or "netlify.app" in origin
+            or "localhost" in origin
         ):
             response.headers.add("Access-Control-Allow-Origin", origin)
         else:
@@ -1654,7 +1688,9 @@ def get_full_pipeline_results(job_id):
         )
 
     except Exception as e:
-        current_app.logger.error(f"Error in get_full_pipeline_results for {job_id}: {str(e)}")
+        current_app.logger.error(
+            f"Error in get_full_pipeline_results for {job_id}: {str(e)}"
+        )
         return jsonify({"error": f"Failed to retrieve results: {str(e)}"}), 500
 
 
@@ -1700,7 +1736,9 @@ def get_full_pipeline_pdfs(job_id):
         return jsonify({"pdfs": pdf_list}), 200
 
     except Exception as e:
-        current_app.logger.error(f"Error in get_full_pipeline_pdfs for {job_id}: {str(e)}")
+        current_app.logger.error(
+            f"Error in get_full_pipeline_pdfs for {job_id}: {str(e)}"
+        )
         return jsonify({"pdfs": [], "error": str(e)}), 500
 
 
@@ -1825,16 +1863,16 @@ def generate_watershed():
                     500,
                 )
 
-            current_app.logger.info(f"Generating watersheds using {site_selection_script}")
+            current_app.logger.info(
+                f"Generating watersheds using {site_selection_script}"
+            )
 
             # Determine the DRN models directory (where input data is located)
             # The script needs to know where to find input/data and input/shp directories
             # Try multiple possible locations
             possible_paths = [
                 # Relative to backend directory
-                os.path.abspath(
-                    os.path.join(_DRN_ROOT, "Models", "DRN", "R_code")
-                ),
+                os.path.abspath(os.path.join(_DRN_ROOT, "Models", "DRN", "R_code")),
                 # Absolute path from home directory
                 os.path.join(
                     os.path.expanduser("~"),
@@ -1856,7 +1894,9 @@ def generate_watershed():
                 input_data_dir = os.path.join(path, "input", "data")
                 if os.path.exists(input_data_dir):
                     drn_models_dir = path
-                    current_app.logger.info(f"Found DRN models directory at: {drn_models_dir}")
+                    current_app.logger.info(
+                        f"Found DRN models directory at: {drn_models_dir}"
+                    )
                     break
 
             if not drn_models_dir:
@@ -2071,7 +2111,9 @@ def check_watershed_status(job_id):
         )
 
     except Exception as e:
-        current_app.logger.error(f"Error in check_watershed_status for {job_id}: {str(e)}")
+        current_app.logger.error(
+            f"Error in check_watershed_status for {job_id}: {str(e)}"
+        )
         return jsonify({"error": f"Status check failed: {str(e)}"}), 500
 
 
@@ -2167,7 +2209,9 @@ def get_watershed_results(job_id):
         return jsonify(response_data)
 
     except Exception as e:
-        current_app.logger.error(f"Error in get_watershed_results for {job_id}: {str(e)}")
+        current_app.logger.error(
+            f"Error in get_watershed_results for {job_id}: {str(e)}"
+        )
         return (
             jsonify({"error": f"Failed to retrieve watershed results: {str(e)}"}),
             500,
@@ -2266,7 +2310,9 @@ def check_outlet_compatibility():
 
             cmd = ["python3", script_path, "--coords-file", tmp_coords_file]
 
-            current_app.logger.debug(f"Running outlet compatibility check: {' '.join(cmd)}")
+            current_app.logger.debug(
+                f"Running outlet compatibility check: {' '.join(cmd)}"
+            )
 
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=60  # 60 second timeout
@@ -2274,7 +2320,9 @@ def check_outlet_compatibility():
 
             if result.returncode != 0:
                 error_msg = result.stderr or result.stdout or "Unknown error"
-                current_app.logger.error(f"Outlet compatibility check failed: {error_msg}")
+                current_app.logger.error(
+                    f"Outlet compatibility check failed: {error_msg}"
+                )
                 return (
                     jsonify(
                         {
@@ -2424,7 +2472,9 @@ def check_outlet_compatibility():
                     except subprocess.TimeoutExpired:
                         current_app.logger.warning("Watershed generation timed out")
                     except Exception as e:
-                        current_app.logger.warning(f"Error generating watersheds: {str(e)}")
+                        current_app.logger.warning(
+                            f"Error generating watersheds: {str(e)}"
+                        )
                         # Don't fail the outlet check if watershed generation fails
 
                 # Success - return result immediately
@@ -2460,6 +2510,7 @@ def check_outlet_compatibility():
 
 
 # SSH connection pool to avoid repeated DUO authentication
+
 
 @drn_bp.route("/api/drn/check-outlet-compatibility/<job_id>/status", methods=["GET"])
 def check_outlet_compatibility_status(job_id):
@@ -2567,7 +2618,9 @@ def check_outlet_compatibility_status(job_id):
                             pass
             except Exception as e:
                 # If we can't read results here, that's okay - frontend will fetch separately
-                current_app.logger.debug(f"Could not read results in status check: {str(e)}")
+                current_app.logger.debug(
+                    f"Could not read results in status check: {str(e)}"
+                )
 
         # Update cache
         job_info["status"] = status
@@ -2884,7 +2937,9 @@ def download_full_pipeline_results(job_id):
             error_msg = stderr.read().decode()
 
             if exit_status != 0:
-                current_app.logger.error(f"Failed to create zip for {job_id}: {error_msg}")
+                current_app.logger.error(
+                    f"Failed to create zip for {job_id}: {error_msg}"
+                )
                 # Don't close pooled connection
                 return jsonify({"error": f"Failed to create zip: {error_msg}"}), 500
 
@@ -2925,7 +2980,9 @@ def download_full_pipeline_results(job_id):
                             f"Job {job_id}: Successfully added PDFs to zip file"
                         )
             else:
-                current_app.logger.info(f"Job {job_id}: No PDF files found in {pdf_dir}")
+                current_app.logger.info(
+                    f"Job {job_id}: No PDF files found in {pdf_dir}"
+                )
 
             # Download the zip file
             sftp = ssh.open_sftp()
@@ -2939,7 +2996,9 @@ def download_full_pipeline_results(job_id):
             # Don't close pooled connection - keep it for reuse
         except paramiko.SSHException as ssh_err:
             error_msg = str(ssh_err)
-            current_app.logger.error(f"SSH error during download for {job_id}: {error_msg}")
+            current_app.logger.error(
+                f"SSH error during download for {job_id}: {error_msg}"
+            )
             if "Authentication failed" in error_msg or "Anomalous request" in error_msg:
                 return (
                     jsonify(
@@ -2987,5 +3046,7 @@ def download_full_pipeline_results(job_id):
 
 if __name__ == "__main__":
     current_app.logger.info(f"Starting Flask server on port 8000")
-    current_app.logger.info(f"CORS origins: {current_app.config.get('CORS_ORIGINS', [])}")
+    current_app.logger.info(
+        f"CORS origins: {current_app.config.get('CORS_ORIGINS', [])}"
+    )
     app.run(host="0.0.0.0", port=8000, debug=True)
