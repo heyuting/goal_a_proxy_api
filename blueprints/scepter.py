@@ -123,7 +123,7 @@ def submit_full_scepter_pipeline():
                 )
 
         timestamp = int(time.time())
-        job_id = f"scepter_full_{timestamp}_{hash(str(coordinate)) % 10000}"
+        job_id = f"scepter_{str(timestamp)[-5:]}"
         job_folder = f"/home/{GRACE_USER}/project/SCEPTER/jobs/{job_id}"
         output_dir = f"{job_folder}/output"
         scepter_path = f"/home/{GRACE_USER}/project/SCEPTER"
@@ -287,7 +287,9 @@ echo "=========================================="
                     if exit_status == 0 and "Submitted batch job" in result:
                         grace_job_id = result.split()[-1]
                         try:
-                            save_cmd = f"echo '{grace_job_id}' > {job_folder}/.grace_job_id"
+                            save_cmd = (
+                                f"echo '{grace_job_id}' > {job_folder}/.grace_job_id"
+                            )
                             stdin2, stdout2, stderr2 = ssh.exec_command(save_cmd)
                             stdout2.channel.recv_exit_status()
                         except Exception:
@@ -302,13 +304,17 @@ echo "=========================================="
                     else:
                         ssh.close()
                         JOB_STATUS_CACHE[job_id].update(
-                            {"status": "failed", "error": f"Failed to submit job: {error}"}
+                            {
+                                "status": "failed",
+                                "error": f"Failed to submit job: {error}",
+                            }
                         )
                         current_app.logger.error(
                             f"SCEPTER job {job_id} submission failed: {error}"
                         )
                 except Exception as e:
                     import traceback
+
                     current_app.logger.error(
                         f"Error in background submission for SCEPTER job {job_id}: {str(e)}"
                     )
@@ -325,13 +331,14 @@ echo "=========================================="
                 "job_id": job_id,
                 "grace_job_id": None,
                 "status": "submitting",
-                "message": f"SCEPTER full pipeline job is being submitted. Job ID: {job_id}. Check status endpoint for updates.",
+                "message": f"SCEPTER job is being submitted.\n\n Job ID: {job_id}.",
                 "parameters": params_data,
             }
         )
 
     except Exception as e:
         import traceback
+
         current_app.logger.error(f"Error in submit_full_scepter_pipeline: {str(e)}")
         current_app.logger.error(traceback.format_exc())
         return (
@@ -350,7 +357,9 @@ echo "=========================================="
 # ---------------------------------------------------------------------------
 
 
-@scepter_bp.route("/api/scepter/full-pipeline/<job_id>/status", methods=["GET", "OPTIONS"])
+@scepter_bp.route(
+    "/api/scepter/full-pipeline/<job_id>/status", methods=["GET", "OPTIONS"]
+)
 def check_full_scepter_pipeline_status(job_id):
     """Check the status of a full SCEPTER pipeline job"""
     if request.method == "OPTIONS":
@@ -456,9 +465,15 @@ def check_full_scepter_pipeline_status(job_id):
                             "message": "Job is being submitted to Grace HPC. Please wait...",
                         }
                     )
-                return jsonify(
-                    {"error": "Job found on Grace but status cannot be determined.", "job_id": job_id}
-                ), 500
+                return (
+                    jsonify(
+                        {
+                            "error": "Job found on Grace but status cannot be determined.",
+                            "job_id": job_id,
+                        }
+                    ),
+                    500,
+                )
 
         status_map = {
             "PENDING": "pending",
@@ -500,7 +515,11 @@ def check_full_scepter_pipeline_status(job_id):
                     sacct_cmd = f"sacct -j {grace_job_id} --format=State --noheader --parsable2 2>/dev/null | head -1 | cut -d'|' -f1"
                     stdin2, stdout2, stderr2 = ssh.exec_command(sacct_cmd)
                     sacct_status = stdout2.read().decode().strip()
-                    status = status_map.get(sacct_status, "submitted") if sacct_status else "submitted"
+                    status = (
+                        status_map.get(sacct_status, "submitted")
+                        if sacct_status
+                        else "submitted"
+                    )
                     if sacct_status and sacct_status.startswith("OUT_OF_ME"):
                         status = "failed"
                 else:
@@ -516,8 +535,15 @@ def check_full_scepter_pipeline_status(job_id):
             if log_content:
                 logs = log_content.split("\n")[-20:]
             oom_indicators = [
-                "out of memory", "out-of-memory", "outofmemory", "memoryerror",
-                "killed", "cannot allocate memory", "memory fault", "oom", "oom-kill",
+                "out of memory",
+                "out-of-memory",
+                "outofmemory",
+                "memoryerror",
+                "killed",
+                "cannot allocate memory",
+                "memory fault",
+                "oom",
+                "oom-kill",
             ]
             log_lower = log_content.lower() if log_content else ""
             if any(ind in log_lower for ind in oom_indicators):
@@ -545,9 +571,7 @@ def check_full_scepter_pipeline_status(job_id):
             f"Error in check_full_scepter_pipeline_status for {job_id}: {str(e)}"
         )
         return (
-            jsonify(
-                {"job_id": job_id, "status": "unknown", "error": str(e)}
-            ),
+            jsonify({"job_id": job_id, "status": "unknown", "error": str(e)}),
             500,
         )
 
@@ -557,7 +581,9 @@ def check_full_scepter_pipeline_status(job_id):
 # ---------------------------------------------------------------------------
 
 
-@scepter_bp.route("/api/scepter/full-pipeline/<job_id>/results", methods=["GET", "OPTIONS"])
+@scepter_bp.route(
+    "/api/scepter/full-pipeline/<job_id>/results", methods=["GET", "OPTIONS"]
+)
 def get_full_scepter_pipeline_results(job_id):
     """Get the results of a completed full SCEPTER pipeline job"""
     if request.method == "OPTIONS":
@@ -580,7 +606,9 @@ def get_full_scepter_pipeline_results(job_id):
 
         ssh = get_ssh_connection()
 
-        check_cmd = f"test -f {job_folder}/.completed && echo 'completed' || echo 'running'"
+        check_cmd = (
+            f"test -f {job_folder}/.completed && echo 'completed' || echo 'running'"
+        )
         stdin, stdout, stderr = ssh.exec_command(check_cmd)
         job_status = stdout.read().decode().strip()
 
@@ -599,9 +627,13 @@ def get_full_scepter_pipeline_results(job_id):
             "file_count": len(output_files),
         }
         if job_status == "completed":
-            results["message"] = "Job completed. Use download endpoint to retrieve all files."
+            results["message"] = (
+                "Job completed. Use download endpoint to retrieve all files."
+            )
         else:
-            results["message"] = "Job is still running. Partial results may be available."
+            results["message"] = (
+                "Job is still running. Partial results may be available."
+            )
 
         ssh.close()
         return jsonify({"job_id": job_id, "status": job_status, "results": results})
@@ -618,7 +650,9 @@ def get_full_scepter_pipeline_results(job_id):
 # ---------------------------------------------------------------------------
 
 
-@scepter_bp.route("/api/scepter/full-pipeline/<job_id>/download", methods=["GET", "OPTIONS"])
+@scepter_bp.route(
+    "/api/scepter/full-pipeline/<job_id>/download", methods=["GET", "OPTIONS"]
+)
 def download_full_scepter_pipeline_results(job_id):
     """Download results as a zip file"""
     if request.method == "OPTIONS":
