@@ -11,7 +11,7 @@ import time
 import re
 import threading
 
-from utils.ssh import get_ssh_connection, get_ssh_connection_pooled, GRACE_USER
+from utils.ssh import get_ssh_connection, get_ssh_connection_pooled, BOUCHET_USER
 
 drn_bp = Blueprint("drn", __name__)
 JOB_STATUS_CACHE = {}  # In production, use Redis or database
@@ -130,15 +130,15 @@ def run_job():
         if not isinstance(parameters, dict):
             return jsonify({"error": "Missing or invalid parameters"}), 400
 
-        # Create unique job folder on Grace server (via SSH)
+        # Create unique job folder on Bouchet server (via SSH)
         timestamp = int(time.time())
         project_path = "DRN"
-        job_folder = f"/home/{GRACE_USER}/project/{project_path}/tmp_{model}_job_{user_id_clean}_{timestamp}"
+        job_folder = f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/{project_path}/tmp_{model}_job_{user_id_clean}_{timestamp}"
 
-        # Connect to Grace via SSH
+        # Connect to Bouchet via SSH
         ssh = get_ssh_connection()
 
-        # Create job folder and write parameters on Grace
+        # Create job folder and write parameters on Bouchet
         commands = [
             f"mkdir -p {job_folder}",
             f"echo '{json.dumps(parameters)}' > {job_folder}/parameters.json",
@@ -158,7 +158,7 @@ def run_job():
         # Submit to SLURM using sbatch via SSH
         project_path = "DRN"
         script_name = "run_drn_job.sh"
-        sbatch_cmd = f"sbatch /home/{GRACE_USER}/project/{project_path}/{script_name} {job_folder}"
+        sbatch_cmd = f"sbatch /home/{BOUCHET_USER}/project_pi_par35/yhs5/{project_path}/{script_name} {job_folder}"
         stdin, stdout, stderr = ssh.exec_command(sbatch_cmd)
 
         result = stdout.read().decode().strip()
@@ -204,7 +204,7 @@ def run_job():
 @drn_bp.route("/api/check-job-status/<job_id>", methods=["GET"])
 def check_job_status(job_id):
     try:
-        # Connect to Grace via SSH
+        # Connect to Bouchet via SSH
         ssh = get_ssh_connection()
 
         # Check SLURM job status via SSH
@@ -230,7 +230,7 @@ def check_job_status(job_id):
             status = status_map.get(slurm_status, "unknown")
         else:
             # Job not in queue, check if output file exists to determine completion
-            check_cmd = f"test -f /home/{GRACE_USER}/project/DRN/tmp_output/drn_{job_id}_1.out && echo 'completed' || echo 'failed'"
+            check_cmd = f"test -f /home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN/tmp_output/drn_{job_id}_1.out && echo 'completed' || echo 'failed'"
             stdin, stdout, stderr = ssh.exec_command(check_cmd)
             output_check = stdout.read().decode().strip()
             status = output_check  # Will be either 'completed' or 'failed'
@@ -239,7 +239,7 @@ def check_job_status(job_id):
         logs = []
         if status in ["completed", "failed"]:
             # Try to get job output
-            log_cmd = f"cat /home/{GRACE_USER}/project/DRN/tmp_output/drn_{job_id}_1.out 2>/dev/null || echo 'No output file found'"
+            log_cmd = f"cat /home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN/tmp_output/drn_{job_id}_1.out 2>/dev/null || echo 'No output file found'"
             stdin, stdout, stderr = ssh.exec_command(log_cmd)
             log_content = stdout.read().decode()
             logs = log_content.split("\n") if log_content else ["No logs available"]
@@ -307,10 +307,10 @@ def submit_full_drn_pipeline():
 
     try:
         # Validate environment variables
-        if not os.getenv("GRACE_HOST"):
-            raise Exception("GRACE_HOST environment variable not set")
-        if not os.getenv("GRACE_USER"):
-            raise Exception("GRACE_USER environment variable not set")
+        if not os.getenv("BOUCHET_HOST"):
+            raise Exception("BOUCHET_HOST environment variable not set")
+        if not os.getenv("BOUCHET_USER"):
+            raise Exception("BOUCHET_USER environment variable not set")
         if not os.getenv("SSH_PRIVATE_KEY"):
             raise Exception("SSH_PRIVATE_KEY environment variable not set")
 
@@ -370,9 +370,9 @@ def submit_full_drn_pipeline():
         # Generate unique job ID immediately
         timestamp = int(time.time())
         job_id = f"drn_{str(timestamp)[-5:]}"
-        job_folder = f"/home/{GRACE_USER}/project/DRN/jobs/{job_id}"
+        job_folder = f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN/jobs/{job_id}"
         output_dir = f"{job_folder}/output"
-        drn_path = f"/home/{GRACE_USER}/project/DRN"
+        drn_path = f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN"
 
         # Prepare parameters data
         params_data = {
@@ -388,7 +388,7 @@ def submit_full_drn_pipeline():
         # Cache job info immediately with "submitting" status
         JOB_STATUS_CACHE[job_id] = {
             "job_id": job_id,
-            "grace_job_id": None,  # Will be set after submission
+            "bouchet_job_id": None,  # Will be set after submission
             "parameters": params_data,
             "job_folder": job_folder,
             "output_dir": output_dir,
@@ -398,7 +398,7 @@ def submit_full_drn_pipeline():
 
         # Start background thread to submit job
         def submit_job_background():
-            """Submit job to Grace HPC in background"""
+            """Submit job to Bouchet HPC in background"""
             from app import app
 
             with app.app_context():
@@ -407,7 +407,7 @@ def submit_full_drn_pipeline():
                         f"Starting background submission for job {job_id}"
                     )
 
-                    # Connect to Grace via SSH
+                    # Connect to Bouchet via SSH
                     ssh = get_ssh_connection()
 
                     # Create job folder and write parameters
@@ -435,7 +435,7 @@ def submit_full_drn_pipeline():
                             return
 
                     # Create SLURM job script for full pipeline
-                    # Use 32G to improve schedulability when Grace is busy (was 64G)
+                    # Use 32G to improve schedulability when Bouchet is busy (was 64G)
                     sbatch_script = f"""#!/bin/bash
     #SBATCH --job-name={job_id[:12]}
     #SBATCH --ntasks=1
@@ -578,7 +578,7 @@ def submit_full_drn_pipeline():
                     # SLURM requires #SBATCH at column 1; strip Python indentation
                     sbatch_script = sbatch_script.replace("\n    ", "\n")
 
-                    # Write SLURM script to Grace
+                    # Write SLURM script to Bouchet
                     script_path = f"{job_folder}/job.sh"
                     stdin, stdout, stderr = ssh.exec_command(
                         f"cat > {script_path} << 'SCRIPT_EOF'\n{sbatch_script}\nSCRIPT_EOF"
@@ -608,42 +608,40 @@ def submit_full_drn_pipeline():
                     exit_status = stdout.channel.recv_exit_status()
 
                     if exit_status == 0 and "Submitted batch job" in result:
-                        # Extract Grace job ID from sbatch output
-                        grace_job_id = result.split()[-1]
+                        # Extract Bouchet job ID from sbatch output
+                        bouchet_job_id = result.split()[-1]
 
-                        # Save grace_job_id to a file in the job folder for persistence
+                        # Save bouchet_job_id to a file in the job folder for persistence
                         # This ensures we can recover it even if the server restarts
                         try:
-                            save_job_id_cmd = (
-                                f"echo '{grace_job_id}' > {job_folder}/.grace_job_id"
-                            )
+                            save_job_id_cmd = f"echo '{bouchet_job_id}' > {job_folder}/.bouchet_job_id"
                             stdin2, stdout2, stderr2 = ssh.exec_command(save_job_id_cmd)
                             exit_status2 = stdout2.channel.recv_exit_status()
                             if exit_status2 == 0:
                                 current_app.logger.info(
-                                    f"Saved grace_job_id {grace_job_id} to {job_folder}/.grace_job_id"
+                                    f"Saved bouchet_job_id {bouchet_job_id} to {job_folder}/.bouchet_job_id"
                                 )
                             else:
                                 current_app.logger.warning(
-                                    f"Failed to save grace_job_id to file: {stderr2.read().decode()}"
+                                    f"Failed to save bouchet_job_id to file: {stderr2.read().decode()}"
                                 )
                         except Exception as save_error:
                             current_app.logger.warning(
-                                f"Error saving grace_job_id to file: {str(save_error)}"
+                                f"Error saving bouchet_job_id to file: {str(save_error)}"
                             )
 
-                        # Close SSH connection after saving grace_job_id
+                        # Close SSH connection after saving bouchet_job_id
                         ssh.close()
 
                         # Update cache with submitted status
                         JOB_STATUS_CACHE[job_id].update(
                             {
-                                "grace_job_id": grace_job_id,
+                                "bouchet_job_id": bouchet_job_id,
                                 "status": "submitted",
                             }
                         )
                         current_app.logger.info(
-                            f"Job {job_id} submitted successfully with Grace job ID {grace_job_id}"
+                            f"Job {job_id} submitted successfully with Bouchet job ID {bouchet_job_id}"
                         )
                     else:
                         # Close SSH connection before handling error
@@ -666,7 +664,7 @@ def submit_full_drn_pipeline():
                                     "error": f"Disk quota issue detected: {error}. Please clean up old job files.",
                                 }
                             )
-                        # Check if error is related to memory / resources (Grace out of memory)
+                        # Check if error is related to memory / resources (Bouchet out of memory)
                         elif any(
                             x in error.lower()
                             for x in (
@@ -679,7 +677,7 @@ def submit_full_drn_pipeline():
                             JOB_STATUS_CACHE[job_id].update(
                                 {
                                     "status": "failed",
-                                    "error": f"Grace HPC is out of memory or resources: {error}. Jobs may be pending; try again later or reduce job requirements.",
+                                    "error": f"Bouchet HPC is out of memory or resources: {error}. Jobs may be pending; try again later or reduce job requirements.",
                                 }
                             )
                 except Exception as e:
@@ -719,7 +717,7 @@ def submit_full_drn_pipeline():
         return jsonify(
             {
                 "job_id": job_id,
-                "grace_job_id": None,  # Will be set after submission
+                "bouchet_job_id": None,  # Will be set after submission
                 "status": "submitting",  # Initial status
                 "message": f"DRN full pipeline job is being submitted. Job ID: {job_id}. Check status endpoint for updates.",
                 "parameters": params_data,
@@ -801,9 +799,10 @@ def check_full_pipeline_status(job_id):
                 500,
             )
 
-        grace_job_id = job_info.get("grace_job_id")
+        bouchet_job_id = job_info.get("bouchet_job_id")
         job_folder = job_info.get(
-            "job_folder", f"/home/{GRACE_USER}/project/DRN/jobs/{job_id}"
+            "job_folder",
+            f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN/jobs/{job_id}",
         )
         submitted_at = job_info.get("submitted_at")
         if submitted_at is None:
@@ -818,25 +817,25 @@ def check_full_pipeline_status(job_id):
             f"[Status Check] Job {job_id} - submitted_at: {submitted_at}, current_time: {time.time()}, time_elapsed: {time_elapsed:.2f} seconds ({time_elapsed/60:.2f} minutes)"
         )
 
-        # If background thread is still submitting (no grace_job_id yet) and it's been less than 60 seconds,
+        # If background thread is still submitting (no bouchet_job_id yet) and it's been less than 60 seconds,
         # avoid SSH connection to prevent race condition with background thread that's connecting
         # This handles cases where Duo 2FA takes time to complete
-        if not grace_job_id and time_elapsed < 120:
+        if not bouchet_job_id and time_elapsed < 30:
             current_app.logger.info(
-                f"[Status Check] Job {job_id} - Background submission still in progress (grace_job_id=None, time_elapsed: {time_elapsed:.2f}s), skipping SSH connection to avoid race condition"
+                f"[Status Check] Job {job_id} - Background submission still in progress (bouchet_job_id=None, time_elapsed: {time_elapsed:.2f}s), skipping SSH connection to avoid race condition"
             )
             return jsonify(
                 {
                     "job_id": job_id,
-                    "grace_job_id": grace_job_id,
+                    "bouchet_job_id": bouchet_job_id,
                     "status": "submitting",
-                    "message": "Job is being submitted to Grace HPC. Please wait...",
+                    "message": "Job is being submitted to Bouchet HPC. Please wait...",
                     "submitted_at": submitted_at,
                     "logs": [],
                 }
             )
 
-        # Connect to Grace via SSH using pooled connection to avoid repeated DUO authentication
+        # Connect to Bouchet via SSH using pooled connection to avoid repeated DUO authentication
         try:
             ssh = get_ssh_connection_pooled()
         except Exception as ssh_error:
@@ -849,7 +848,7 @@ def check_full_pipeline_status(job_id):
                     {
                         "job_id": job_id,
                         "status": "submitting",
-                        "message": "Job is being submitted to Grace HPC. Please wait...",
+                        "message": "Job is being submitted to Bouchet HPC. Please wait...",
                     }
                 )
             else:
@@ -858,19 +857,19 @@ def check_full_pipeline_status(job_id):
                         {
                             "job_id": job_id,
                             "status": "unknown",
-                            "error": f"Failed to connect to Grace HPC: {str(ssh_error)}",
+                            "error": f"Failed to connect to Bouchet HPC: {str(ssh_error)}",
                             "message": "Unable to check job status. Please try again later.",
                         }
                     ),
                     500,
                 )
 
-        # If job not in cache or grace_job_id is None, try to recover by checking if job folder exists
-        if not grace_job_id:
+        # If job not in cache or bouchet_job_id is None, try to recover by checking if job folder exists
+        if not bouchet_job_id:
             current_app.logger.info(
-                f"[Status Check] Job {job_id} - grace_job_id is None, attempting recovery..."
+                f"[Status Check] Job {job_id} - bouchet_job_id is None, attempting recovery..."
             )
-            # Check if job folder exists on Grace
+            # Check if job folder exists on Bouchet
             check_folder_cmd = (
                 f"test -d {job_folder} && echo 'exists' || echo 'not_found'"
             )
@@ -887,9 +886,9 @@ def check_full_pipeline_status(job_id):
                     return jsonify(
                         {
                             "job_id": job_id,
-                            "grace_job_id": None,
+                            "bouchet_job_id": None,
                             "status": "submitting",
-                            "message": "Job is being submitted to Grace HPC. Please wait...",
+                            "message": "Job is being submitted to Bouchet HPC. Please wait...",
                         }
                     )
                 else:
@@ -905,12 +904,12 @@ def check_full_pipeline_status(job_id):
                         404,
                     )
 
-            # Try to recover grace_job_id from saved file first (most reliable)
-            read_job_id_cmd = f"cat {job_folder}/.grace_job_id 2>/dev/null || echo ''"
+            # Try to recover bouchet_job_id from saved file first (most reliable)
+            read_job_id_cmd = f"cat {job_folder}/.bouchet_job_id 2>/dev/null || echo ''"
             stdin, stdout, stderr = ssh.exec_command(read_job_id_cmd)
             recovered_job_id = stdout.read().decode().strip()
             current_app.logger.info(
-                f"[Status Check] Job {job_id} - Attempted to recover grace_job_id from .grace_job_id file: '{recovered_job_id}'"
+                f"[Status Check] Job {job_id} - Attempted to recover bouchet_job_id from .bouchet_job_id file: '{recovered_job_id}'"
             )
 
             # If not found in file, try to find it from log files (fallback)
@@ -919,40 +918,40 @@ def check_full_pipeline_status(job_id):
                 stdin2, stdout2, stderr2 = ssh.exec_command(find_job_id_cmd)
                 recovered_job_id = stdout2.read().decode().strip()
                 current_app.logger.info(
-                    f"[Status Check] Job {job_id} - Attempted to recover grace_job_id from logs: '{recovered_job_id}'"
+                    f"[Status Check] Job {job_id} - Attempted to recover bouchet_job_id from logs: '{recovered_job_id}'"
                 )
 
             if recovered_job_id:
-                grace_job_id = recovered_job_id
+                bouchet_job_id = recovered_job_id
 
                 # If we recovered from logs (not from file), save it to file for future use
-                # Check if file exists on Grace
-                check_file_cmd = f"test -f {job_folder}/.grace_job_id && echo 'exists' || echo 'not_exists'"
+                # Check if file exists on Bouchet
+                check_file_cmd = f"test -f {job_folder}/.bouchet_job_id && echo 'exists' || echo 'not_exists'"
                 stdin3, stdout3, stderr3 = ssh.exec_command(check_file_cmd)
                 file_exists = stdout3.read().decode().strip()
 
                 if file_exists == "not_exists":
-                    # File doesn't exist, save the recovered grace_job_id
+                    # File doesn't exist, save the recovered bouchet_job_id
                     try:
                         save_job_id_cmd = (
-                            f"echo '{grace_job_id}' > {job_folder}/.grace_job_id"
+                            f"echo '{bouchet_job_id}' > {job_folder}/.bouchet_job_id"
                         )
                         stdin4, stdout4, stderr4 = ssh.exec_command(save_job_id_cmd)
                         exit_status4 = stdout4.channel.recv_exit_status()
                         if exit_status4 == 0:
                             current_app.logger.info(
-                                f"Saved recovered grace_job_id {grace_job_id} to {job_folder}/.grace_job_id"
+                                f"Saved recovered bouchet_job_id {bouchet_job_id} to {job_folder}/.bouchet_job_id"
                             )
                     except Exception as save_error:
                         current_app.logger.warning(
-                            f"Error saving recovered grace_job_id to file: {str(save_error)}"
+                            f"Error saving recovered bouchet_job_id to file: {str(save_error)}"
                         )
 
                 # Reconstruct job_info and cache it, preserving existing cache data
                 existing_job_info = JOB_STATUS_CACHE.get(job_id, {})
                 job_info = {
                     "job_id": job_id,
-                    "grace_job_id": grace_job_id,
+                    "bouchet_job_id": bouchet_job_id,
                     "job_folder": job_folder,
                     "submitted_at": existing_job_info.get(
                         "submitted_at", time.time()
@@ -969,12 +968,12 @@ def check_full_pipeline_status(job_id):
                 }
                 JOB_STATUS_CACHE[job_id] = job_info
                 current_app.logger.info(
-                    f"Recovered job {job_id} with grace_job_id {grace_job_id} (preserved submitted_at: {job_info.get('submitted_at')})"
+                    f"Recovered job {job_id} with bouchet_job_id {bouchet_job_id} (preserved submitted_at: {job_info.get('submitted_at')})"
                 )
             else:
                 # Job folder exists but no job_id found - check completion status first
                 current_app.logger.info(
-                    f"[Status Check] Job {job_id} - No grace_job_id found in logs, checking completion status..."
+                    f"[Status Check] Job {job_id} - No bouchet_job_id found in logs, checking completion status..."
                 )
 
                 # Check multiple indicators of completion
@@ -1044,7 +1043,7 @@ def check_full_pipeline_status(job_id):
                         {
                             "job_id": job_id,
                             "status": "completed",
-                            "message": "Job completed (recovered from Grace filesystem)",
+                            "message": "Job completed (recovered from Bouchet filesystem)",
                         }
                     )
                 else:
@@ -1062,47 +1061,47 @@ def check_full_pipeline_status(job_id):
                         return jsonify(
                             {
                                 "job_id": job_id,
-                                "grace_job_id": None,
+                                "bouchet_job_id": None,
                                 "status": "submitting",
-                                "message": "Job is being submitted to Grace HPC. Please wait...",
+                                "message": "Job is being submitted to Bouchet HPC. Please wait...",
                             }
                         )
                     else:
                         # Submission timeout - something went wrong
                         current_app.logger.warning(
-                            f"[Status Check] Job {job_id} - Time elapsed > 300s but no completion marker and no grace_job_id"
+                            f"[Status Check] Job {job_id} - Time elapsed > 300s but no completion marker and no bouchet_job_id"
                         )
                         # Don't close pooled connection
                         return (
                             jsonify(
                                 {
-                                    "error": "Job found on Grace but status cannot be determined. The job may be in an unknown state.",
+                                    "error": "Job found on Bouchet but status cannot be determined. The job may be in an unknown state.",
                                     "job_id": job_id,
                                 }
                             ),
                             500,
                         )
 
-        # Ensure grace_job_id is not None before checking SLURM
-        # But first, check if job is completed even without grace_job_id
-        if not grace_job_id:
+        # Ensure bouchet_job_id is not None before checking SLURM
+        # But first, check if job is completed even without bouchet_job_id
+        if not bouchet_job_id:
             # Check if job is completed before assuming it's still submitting
             check_completion_cmd = f"test -f {job_folder}/.completed && echo 'completed' || echo 'not_completed'"
             stdin, stdout, stderr = ssh.exec_command(check_completion_cmd)
             completion_check = stdout.read().decode().strip()
             current_app.logger.info(
-                f"[Status Check] Job {job_id} - grace_job_id is None, checking completion: '{completion_check}'"
+                f"[Status Check] Job {job_id} - bouchet_job_id is None, checking completion: '{completion_check}'"
             )
 
             if completion_check == "completed":
-                # Job is completed even though we don't have grace_job_id
+                # Job is completed even though we don't have bouchet_job_id
                 # Don't close pooled connection
                 return jsonify(
                     {
                         "job_id": job_id,
-                        "grace_job_id": None,
+                        "bouchet_job_id": None,
                         "status": "completed",
-                        "message": "Job completed (recovered from Grace filesystem)",
+                        "message": "Job completed (recovered from Bouchet filesystem)",
                     }
                 )
 
@@ -1112,39 +1111,40 @@ def check_full_pipeline_status(job_id):
                 return jsonify(
                     {
                         "job_id": job_id,
-                        "grace_job_id": None,
+                        "bouchet_job_id": None,
                         "status": "submitting",
-                        "message": "Job is being submitted to Grace HPC. Please wait...",
+                        "message": "Job is being submitted to Bouchet HPC. Please wait...",
                     }
                 )
             else:
-                # Time elapsed > 5 minutes but no grace_job_id and not completed
+                # Time elapsed > 5 minutes but no bouchet_job_id and not completed
                 # Don't close pooled connection
                 return jsonify(
                     {
                         "job_id": job_id,
-                        "grace_job_id": None,
+                        "bouchet_job_id": None,
                         "status": "unknown",
                         "message": "Job status cannot be determined. The job may be in an unknown state.",
                     }
                 )
 
         job_folder = job_info.get(
-            "job_folder", f"/home/{GRACE_USER}/project/DRN/jobs/{job_id}"
+            "job_folder",
+            f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN/jobs/{job_id}",
         )
         cached_status = job_info.get("status")
 
         # Initialize status with a default value to prevent undefined
         status = "unknown"
 
-        # If job was just submitted successfully (has grace_job_id and cached status is "submitted"),
+        # If job was just submitted successfully (has bouchet_job_id and cached status is "submitted"),
         # check SLURM first to see if it's already progressed, then return appropriate status
-        if grace_job_id and cached_status == "submitted":
+        if bouchet_job_id and cached_status == "submitted":
             current_app.logger.info(
-                f"[Status Check] Job {job_id} - Job successfully submitted with grace_job_id {grace_job_id}, checking SLURM status"
+                f"[Status Check] Job {job_id} - Job successfully submitted with bouchet_job_id {bouchet_job_id}, checking SLURM status"
             )
             # Check SLURM to see if it's moved to pending/running/completed
-            squeue_cmd = f"squeue -j {grace_job_id} --format='%T' --noheader"
+            squeue_cmd = f"squeue -j {bouchet_job_id} --format='%T' --noheader"
             stdin, stdout, stderr = ssh.exec_command(squeue_cmd)
             slurm_status_raw = stdout.read().decode().strip()
             slurm_status = slurm_status_raw.split("\n")[0] if slurm_status_raw else ""
@@ -1180,12 +1180,12 @@ def check_full_pipeline_status(job_id):
             return jsonify(
                 {
                     "job_id": job_id,
-                    "grace_job_id": grace_job_id,
+                    "bouchet_job_id": bouchet_job_id,
                     "status": status,
                     "submitted_at": submitted_at,
                     "logs": [],
                     "message": (
-                        f"Job submitted successfully to Grace HPC with job ID {grace_job_id}"
+                        f"Job submitted successfully to Bouchet HPC with job ID {bouchet_job_id}"
                         if status == "submitted"
                         else None
                     ),
@@ -1194,22 +1194,22 @@ def check_full_pipeline_status(job_id):
 
         # If cached status is already "running", "pending", or "completed", don't override it
         # Continue with normal SLURM checking logic below
-        if grace_job_id and cached_status in ["running", "pending", "completed"]:
+        if bouchet_job_id and cached_status in ["running", "pending", "completed"]:
             current_app.logger.info(
                 f"[Status Check] Job {job_id} - Cached status is already '{cached_status}', proceeding with normal status check"
             )
 
-        # Ensure grace_job_id is valid before using it
-        if not grace_job_id or not isinstance(grace_job_id, str):
+        # Ensure bouchet_job_id is valid before using it
+        if not bouchet_job_id or not isinstance(bouchet_job_id, str):
             current_app.logger.warning(
-                f"Invalid grace_job_id for job {job_id}: {grace_job_id}"
+                f"Invalid bouchet_job_id for job {job_id}: {bouchet_job_id}"
             )
             # Check if job is completed before assuming it's still submitting
             check_completion_cmd = f"test -f {job_folder}/.completed && echo 'completed' || echo 'not_completed'"
             stdin, stdout, stderr = ssh.exec_command(check_completion_cmd)
             completion_check = stdout.read().decode().strip()
             current_app.logger.info(
-                f"[Status Check] Job {job_id} - Invalid grace_job_id, checking completion: '{completion_check}'"
+                f"[Status Check] Job {job_id} - Invalid bouchet_job_id, checking completion: '{completion_check}'"
             )
 
             if completion_check == "completed":
@@ -1217,9 +1217,9 @@ def check_full_pipeline_status(job_id):
                 return jsonify(
                     {
                         "job_id": job_id,
-                        "grace_job_id": None,
+                        "bouchet_job_id": None,
                         "status": "completed",
-                        "message": "Job completed (recovered from Grace filesystem)",
+                        "message": "Job completed (recovered from Bouchet filesystem)",
                     }
                 )
 
@@ -1227,14 +1227,14 @@ def check_full_pipeline_status(job_id):
             return jsonify(
                 {
                     "job_id": job_id,
-                    "grace_job_id": None,
+                    "bouchet_job_id": None,
                     "status": "submitting",
-                    "message": "Job is being submitted to Grace HPC. Please wait...",
+                    "message": "Job is being submitted to Bouchet HPC. Please wait...",
                 }
             )
 
         # Check SLURM job status
-        squeue_cmd = f"squeue -j {grace_job_id} --format='%T' --noheader"
+        squeue_cmd = f"squeue -j {bouchet_job_id} --format='%T' --noheader"
         stdin, stdout, stderr = ssh.exec_command(squeue_cmd)
         slurm_status_raw = stdout.read().decode().strip()
         slurm_status = slurm_status_raw.split("\n")[0] if slurm_status_raw else ""
@@ -1291,12 +1291,12 @@ def check_full_pipeline_status(job_id):
             )
 
             if completion_check == "completed":
-                # Job is completed - verify with sacct if we have grace_job_id
+                # Job is completed - verify with sacct if we have bouchet_job_id
                 current_app.logger.info(
                     f"[Status Check] Job {job_id} - Completion marker found, verifying with sacct..."
                 )
-                if grace_job_id:
-                    sacct_cmd = f"sacct -j {grace_job_id} --format=State --noheader --parsable2 2>/dev/null | head -1 | cut -d'|' -f1"
+                if bouchet_job_id:
+                    sacct_cmd = f"sacct -j {bouchet_job_id} --format=State --noheader --parsable2 2>/dev/null | head -1 | cut -d'|' -f1"
                     stdin2, stdout2, stderr2 = ssh.exec_command(sacct_cmd)
                     sacct_status = stdout2.read().decode().strip()
                     current_app.logger.info(
@@ -1317,7 +1317,7 @@ def check_full_pipeline_status(job_id):
                 else:
                     status = "completed"  # Completion marker exists
                     current_app.logger.info(
-                        f"[Status Check] Job {job_id} - No grace_job_id, but completion marker exists. Setting status to 'completed'"
+                        f"[Status Check] Job {job_id} - No bouchet_job_id, but completion marker exists. Setting status to 'completed'"
                     )
             else:
                 # Job not completed - check if it was just submitted or is still running
@@ -1332,7 +1332,7 @@ def check_full_pipeline_status(job_id):
                     )
                 elif cached_status == "submitted":
                     # Job was just submitted but not in queue yet - check sacct
-                    sacct_cmd = f"sacct -j {grace_job_id} --format=State --noheader --parsable2 2>/dev/null | head -1 | cut -d'|' -f1"
+                    sacct_cmd = f"sacct -j {bouchet_job_id} --format=State --noheader --parsable2 2>/dev/null | head -1 | cut -d'|' -f1"
                     stdin2, stdout2, stderr2 = ssh.exec_command(sacct_cmd)
                     sacct_status = stdout2.read().decode().strip()
                     current_app.logger.info(
@@ -1414,7 +1414,7 @@ def check_full_pipeline_status(job_id):
                 or "Disk quota" in all_log_content
             ):
                 status = "failed"
-                error_message = "Disk quota exceeded on Grace HPC. Please clean up old job files or contact the system administrator."
+                error_message = "Disk quota exceeded on Bouchet HPC. Please clean up old job files or contact the system administrator."
                 current_app.logger.error(
                     f"[Status Check] Job {job_id} - Disk quota exceeded detected in logs"
                 )
@@ -1440,7 +1440,7 @@ def check_full_pipeline_status(job_id):
                 if status == "completed":
                     status = "failed"
                 error_message = (
-                    "Job ran out of memory (OOM) on Grace HPC. "
+                    "Job ran out of memory (OOM) on Bouchet HPC. "
                     "Try reducing the workload or request more memory for the job."
                 )
                 current_app.logger.error(
@@ -1562,7 +1562,7 @@ def check_full_pipeline_status(job_id):
 
         response_data = {
             "job_id": job_id,
-            "grace_job_id": grace_job_id,
+            "bouchet_job_id": bouchet_job_id,
             "status": status,  # Guaranteed to be a valid string
             "submitted_at": job_info.get("submitted_at")
             or time.time(),  # Ensure never None
@@ -1631,11 +1631,12 @@ def get_full_pipeline_results(job_id):
         # Get cached job info
         job_info = JOB_STATUS_CACHE.get(job_id, {})
         job_folder = job_info.get(
-            "job_folder", f"/home/{GRACE_USER}/project/DRN/jobs/{job_id}"
+            "job_folder",
+            f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN/jobs/{job_id}",
         )
         output_dir = job_info.get("output_dir", f"{job_folder}/output")
 
-        # Connect to Grace via SSH
+        # Connect to Bouchet via SSH
         ssh = get_ssh_connection()
 
         # Allow access to results even if job is still running
@@ -1701,12 +1702,13 @@ def get_full_pipeline_pdfs(job_id):
     try:
         job_info = JOB_STATUS_CACHE.get(job_id, {})
         job_folder = job_info.get(
-            "job_folder", f"/home/{GRACE_USER}/project/DRN/jobs/{job_id}"
+            "job_folder",
+            f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN/jobs/{job_id}",
         )
         output_dir = job_info.get("output_dir", f"{job_folder}/output")
         pdf_dir = f"{output_dir}/figure/ode_output"
 
-        # Connect to Grace via SSH
+        # Connect to Bouchet via SSH
         ssh = get_ssh_connection()
 
         # Allow access to PDFs even if job is still running
@@ -1749,13 +1751,14 @@ def download_full_pipeline_pdf(job_id, pdf_name):
     try:
         job_info = JOB_STATUS_CACHE.get(job_id, {})
         job_folder = job_info.get(
-            "job_folder", f"/home/{GRACE_USER}/project/DRN/jobs/{job_id}"
+            "job_folder",
+            f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN/jobs/{job_id}",
         )
         output_dir = job_info.get("output_dir", f"{job_folder}/output")
         pdf_dir = f"{output_dir}/figure/ode_output"
         pdf_path = f"{pdf_dir}/{pdf_name}"
 
-        # Connect to Grace via SSH
+        # Connect to Bouchet via SSH
         ssh = get_ssh_connection()
 
         # Check if PDF exists
@@ -1882,8 +1885,8 @@ def generate_watershed():
                     "DRN",
                     "R_code",
                 ),
-                # Grace HPC path
-                "/home/yhs5/project/DRN/R_code",
+                # Bouchet HPC path
+                "/home/yhs5/project_pi_par35/yhs5/DRN/R_code",
                 # Current working directory
                 os.path.join(os.getcwd(), "Models", "DRN", "R_code"),
             ]
@@ -2057,19 +2060,20 @@ def check_watershed_status(job_id):
     """Check the status of a watershed generation job"""
     try:
         job_info = JOB_STATUS_CACHE.get(job_id, {})
-        grace_job_id = job_info.get("grace_job_id")
+        bouchet_job_id = job_info.get("bouchet_job_id")
         job_folder = job_info.get(
-            "job_folder", f"/home/{GRACE_USER}/project/DRN/jobs/{job_id}"
+            "job_folder",
+            f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN/jobs/{job_id}",
         )
 
-        if not grace_job_id:
+        if not bouchet_job_id:
             return jsonify({"error": "Job not found"}), 404
 
-        # Connect to Grace via SSH
+        # Connect to Bouchet via SSH
         ssh = get_ssh_connection()
 
         # Check SLURM job status
-        squeue_cmd = f"squeue -j {grace_job_id} --format='%T' --noheader"
+        squeue_cmd = f"squeue -j {bouchet_job_id} --format='%T' --noheader"
         stdin, stdout, stderr = ssh.exec_command(squeue_cmd)
         slurm_status_raw = stdout.read().decode().strip()
         slurm_status = slurm_status_raw.split("\n")[0] if slurm_status_raw else ""
@@ -2105,7 +2109,7 @@ def check_watershed_status(job_id):
         return jsonify(
             {
                 "job_id": job_id,
-                "grace_job_id": grace_job_id,
+                "bouchet_job_id": bouchet_job_id,
                 "status": status,
             }
         )
@@ -2135,10 +2139,11 @@ def get_watershed_results(job_id):
     try:
         job_info = JOB_STATUS_CACHE.get(job_id, {})
         output_dir = job_info.get(
-            "output_dir", f"/home/{GRACE_USER}/project/DRN/jobs/{job_id}/output"
+            "output_dir",
+            f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN/jobs/{job_id}/output",
         )
 
-        # Connect to Grace via SSH
+        # Connect to Bouchet via SSH
         ssh = get_ssh_connection()
 
         # Read GeoJSON files from Step 1 output
@@ -2518,17 +2523,17 @@ def check_outlet_compatibility_status(job_id):
     try:
         # Get cached job info
         job_info = JOB_STATUS_CACHE.get(job_id, {})
-        grace_job_id = job_info.get("grace_job_id")
+        bouchet_job_id = job_info.get("bouchet_job_id")
         job_folder = job_info.get("job_folder")
 
-        if not grace_job_id or not job_folder:
+        if not bouchet_job_id or not job_folder:
             return jsonify({"error": "Job not found"}), 404
 
         # Use pooled SSH connection to avoid repeated DUO authentication
         ssh = get_ssh_connection_pooled()
 
         # Check SLURM job status
-        squeue_cmd = f"squeue -j {grace_job_id} --format='%T' --noheader"
+        squeue_cmd = f"squeue -j {bouchet_job_id} --format='%T' --noheader"
         stdin, stdout, stderr = ssh.exec_command(squeue_cmd)
         slurm_status_raw = stdout.read().decode().strip()
         slurm_status = slurm_status_raw.split("\n")[0] if slurm_status_raw else ""
@@ -2631,7 +2636,7 @@ def check_outlet_compatibility_status(job_id):
 
         response_data = {
             "job_id": job_id,
-            "grace_job_id": grace_job_id,
+            "bouchet_job_id": bouchet_job_id,
             "status": status,
         }
 
@@ -2804,11 +2809,12 @@ def get_full_pipeline_site_selection_results(job_id):
     try:
         job_info = JOB_STATUS_CACHE.get(job_id, {})
         job_folder = job_info.get(
-            "job_folder", f"/home/{GRACE_USER}/project/DRN/jobs/{job_id}"
+            "job_folder",
+            f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN/jobs/{job_id}",
         )
         output_dir = job_info.get("output_dir", f"{job_folder}/output")
 
-        # Connect to Grace via SSH
+        # Connect to Bouchet via SSH
         ssh = get_ssh_connection()
 
         # Read GeoJSON files from Step 1 output (same structure as site-selection endpoint)
@@ -2890,11 +2896,12 @@ def download_full_pipeline_results(job_id):
 
         job_info = JOB_STATUS_CACHE.get(job_id, {})
         job_folder = job_info.get(
-            "job_folder", f"/home/{GRACE_USER}/project/DRN/jobs/{job_id}"
+            "job_folder",
+            f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN/jobs/{job_id}",
         )
         output_dir = job_info.get("output_dir", f"{job_folder}/output")
 
-        # Connect to Grace via SSH using pooled connection to avoid repeated DUO authentication
+        # Connect to Bouchet via SSH using pooled connection to avoid repeated DUO authentication
         try:
             ssh = get_ssh_connection_pooled()
         except Exception as ssh_error:
@@ -2915,7 +2922,7 @@ def download_full_pipeline_results(job_id):
             return (
                 jsonify(
                     {
-                        "error": f"Failed to connect to Grace HPC: {error_msg}",
+                        "error": f"Failed to connect to Bouchet HPC: {error_msg}",
                         "job_id": job_id,
                     }
                 ),
@@ -2923,7 +2930,7 @@ def download_full_pipeline_results(job_id):
             )
 
         # Allow download even if job is still running (downloads whatever is available)
-        # Create a zip file on Grace and download it
+        # Create a zip file on Bouchet and download it
         # Include both output folder and PDF files
         try:
             pdf_dir = f"{output_dir}/figure/ode_output"

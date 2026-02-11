@@ -1,11 +1,11 @@
-"""SSH connection utilities for Grace HPC."""
+"""SSH connection utilities for Bouchet HPC."""
 import io
 import os
 import time
 import threading
 import paramiko
 
-GRACE_USER = os.getenv("GRACE_USER", "yhs5")
+BOUCHET_USER = os.getenv("BOUCHET_USER", "yhs5")
 
 # SSH connection pool to avoid repeated DUO authentication
 _ssh_connection_pool = None
@@ -14,12 +14,12 @@ _ssh_connection_last_used = None
 
 
 def get_ssh_connection():
-    """Create SSH connection to Grace server"""
+    """Create SSH connection to Bouchet server"""
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
-    hostname = os.getenv("GRACE_HOST")
-    username = os.getenv("GRACE_USER")
+    hostname = os.getenv("BOUCHET_HOST")
+    username = os.getenv("BOUCHET_USER")
     private_key_str = os.getenv("SSH_PRIVATE_KEY")
 
     if not private_key_str:

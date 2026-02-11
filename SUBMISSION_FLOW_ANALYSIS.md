@@ -25,7 +25,7 @@
 
 2. **Background Thread (Asynchronous)**
    - Connects to Grace HPC via SSH
-   - Creates job folder: `/home/{GRACE_USER}/project/DRN/jobs/{job_id}`
+   - Creates job folder: `/home/{GRACE_USER}/project_pi_par35/yhs5/DRN/jobs/{job_id}`
    - Creates output directory
    - Writes parameters.json
    - Creates SLURM job script

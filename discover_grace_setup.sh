@@ -1,8 +1,8 @@
 #!/bin/bash
-# Helper script to discover correct Python environment and modules on Grace
-# Run this on Grace to find the correct paths
+# Helper script to discover correct Python environment and modules on Bouchet
+# Run this on Bouchet to find the correct paths
 
-echo "=== Discovering Grace Setup ==="
+echo "=== Discovering Bouchet Setup ==="
 echo ""
 
 echo "1. Available Python modules:"
@@ -14,7 +14,7 @@ module avail GDAL 2>&1 | grep -i gdal || echo "No GDAL modules found"
 
 echo ""
 echo "3. Searching for Python virtual environments:"
-DRN_PATH="/home/yhs5/project/DRN/R_code/python_version"
+DRN_PATH="/home/yhs5/project_pi_par35/yhs5/DRN/R_code/python_version"
 if [ -d "$DRN_PATH" ]; then
     echo "Checking $DRN_PATH:"
     cd "$DRN_PATH"

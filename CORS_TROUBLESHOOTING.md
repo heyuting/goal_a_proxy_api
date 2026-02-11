@@ -77,12 +77,12 @@ Example payload:
 
 1. **Receives request** at `/api/drn/site-selection`
 2. **Validates** coordinates (lat/lon ranges, format)
-3. **Creates job folder** on Grace: `/home/yhs5/project/DRN/jobs/{job_id}/`
+3. **Creates job folder** on Bouchet: `/home/yhs5/project_pi_par35/yhs5/DRN/jobs/{job_id}/`
 4. **Writes coordinates** to `coords.json` in job folder
 5. **Creates SLURM script** that:
    - Runs Python script with coordinates
    - Converts shapefiles to GeoJSON
-6. **Submits SLURM job** to Grace
+6. **Submits SLURM job** to Bouchet
 7. **Returns job_id** to frontend
 
 ## Debugging Steps
