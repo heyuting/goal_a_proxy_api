@@ -1150,7 +1150,7 @@ def check_full_pipeline_status(job_id):
             slurm_status = slurm_status_raw.split("\n")[0] if slurm_status_raw else ""
 
             if slurm_status:
-                # Job is already in queue, use SLURM status (don't go back to "submitted")
+                # Job is in queue, use SLURM status
                 status_map = {
                     "PENDING": "pending",
                     "RUNNING": "running",
@@ -1164,17 +1164,52 @@ def check_full_pipeline_status(job_id):
                 }
                 status = status_map.get(slurm_status, "submitted")
                 current_app.logger.info(
-                    f"[Status Check] Job {job_id} - Found in SLURM queue: '{slurm_status}' -> '{status}' (not changing back to submitted)"
+                    f"[Status Check] Job {job_id} - Found in SLURM queue: '{slurm_status}' -> '{status}'"
                 )
-                # Update cache with the actual status
                 job_info["status"] = status
                 JOB_STATUS_CACHE[job_id] = job_info
             else:
-                # Not in queue yet, but we know it was submitted - return "submitted"
-                status = "submitted"
+                # Not in queue - may have finished already (fast on Bouchet). Check completion/sacct.
                 current_app.logger.info(
-                    f"[Status Check] Job {job_id} - Not in SLURM queue yet, returning 'submitted' status"
+                    f"[Status Check] Job {job_id} - Not in SLURM queue, checking if already completed..."
                 )
+                check_completion_cmd = f"test -f {job_folder}/.completed && echo 'completed' || echo 'not_completed'"
+                stdin, stdout, stderr = ssh.exec_command(check_completion_cmd)
+                completion_check = stdout.read().decode().strip()
+                if completion_check == "completed":
+                    status = "completed"
+                    current_app.logger.info(
+                        f"[Status Check] Job {job_id} - Completion marker found, job completed"
+                    )
+                    job_info["status"] = status
+                    JOB_STATUS_CACHE[job_id] = job_info
+                else:
+                    sacct_cmd = f"sacct -j {bouchet_job_id} --format=State --noheader --parsable2 2>/dev/null | head -1 | cut -d'|' -f1"
+                    stdin, stdout, stderr = ssh.exec_command(sacct_cmd)
+                    sacct_status = stdout.read().decode().strip()
+                    if sacct_status:
+                        status_map = {
+                            "COMPLETED": "completed",
+                            "PENDING": "pending",
+                            "RUNNING": "running",
+                            "FAILED": "failed",
+                            "CANCELLED": "failed",
+                            "TIMEOUT": "failed",
+                            "OUT_OF_MEMORY": "failed",
+                            "OUT_OF_MEMMORY": "failed",
+                            "OUT_OF_ME+": "failed",
+                        }
+                        status = status_map.get(sacct_status, "submitted")
+                        current_app.logger.info(
+                            f"[Status Check] Job {job_id} - sacct state: '{sacct_status}' -> '{status}'"
+                        )
+                        job_info["status"] = status
+                        JOB_STATUS_CACHE[job_id] = job_info
+                    else:
+                        status = "submitted"
+                        current_app.logger.info(
+                            f"[Status Check] Job {job_id} - No queue/sacct/completion yet, returning 'submitted'"
+                        )
 
             # Return immediately with current status
             return jsonify(

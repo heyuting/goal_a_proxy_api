@@ -471,13 +471,45 @@ def submit_baseline_simulation():
 #SBATCH --error={job_folder}/%x_%j.err
 
 set -x
+
 cd {scepter_path}
+
+# Use a venv with numpy/deps if present (spinup.py needs numpy, make_inputs, etc.)
+for venv_path in ".venv" "venv" "../venv"; do
+    if [ -f "$venv_path/bin/activate" ]; then
+        if "$venv_path/bin/python" -c "import numpy" 2>/dev/null; then
+            echo "Activating venv at $venv_path (numpy OK)"
+            set +u
+            source "$venv_path/bin/activate"
+            set -u
+            break
+        fi
+    fi
+done
+
+# So Python can find the spinup module (e.g. spinup.py or spinup/ inside SCEPTER)
+export PYTHONPATH="{scepter_path}:{job_folder}:${{PYTHONPATH:-}}"
+export SCEPTER_ROOT="{scepter_path}"
+
+# Step 1: create_spinup_slurm_jobs.py writes parameters and creates the main spinup script (e.g. spinup_name.sh)
 python3 {create_spinup_script} {job_folder}
 EXIT=$?
-if [ $EXIT -eq 0 ]; then
-    echo "Job completed at $(date)" > {job_folder}/.completed
+if [ $EXIT -ne 0 ]; then
+    echo "ERROR: create_spinup_slurm_jobs.py failed with exit $EXIT"
+    exit $EXIT
 fi
-exit $EXIT
+
+# Step 2: Run the main spinup script from SCEPTER dir so make/./data resolve (SCEPTER_ROOT already set)
+for f in {job_folder}/*.sh; do
+    [ -f "$f" ] || continue
+    base="$(basename "$f")"
+    [ "$base" = "job.sh" ] && continue
+    echo "Running main spinup script: $base (cwd=$SCEPTER_ROOT)"
+    (cd "$SCEPTER_ROOT" && bash "$f") || exit 1
+done
+
+echo "Job completed at $(date)" > {job_folder}/.completed
+exit 0
 """
 
                     script_path = f"{job_folder}/job.sh"
