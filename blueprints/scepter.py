@@ -762,7 +762,12 @@ def submit_run_scepter_model():
     """
     Run SCEPTER model: python3 restart_add_gbas.py <spinup_name> <restart_name> on Bouchet.
     spinup_name comes from the baseline simulation (e.g. baseline job_id).
-    Payload: { "spinup_name": "...", "restart_name": "..." }
+    Payload: {
+        "spinup_name": "...", "restart_name": "...",
+        "particle_size": <required>,
+        "application_rate": <required>,  # ton/ha/yr
+        "target_pH": <optional>
+    }
     """
     if request.method == "OPTIONS":
         response = make_response()
@@ -788,6 +793,11 @@ def submit_run_scepter_model():
         payload = request.get_json(silent=True) or {}
         spinup_name = payload.get("spinup_name") or payload.get("spinupName")
         restart_name = payload.get("restart_name") or payload.get("restartName")
+        target_pH = (
+            payload.get("target_pH")
+            or payload.get("targetpH")
+            or payload.get("target_pH_arg")
+        )
 
         if (
             not spinup_name
@@ -807,8 +817,37 @@ def submit_run_scepter_model():
         ):
             return jsonify({"error": "restart_name is required"}), 400
 
+        particle_size = (
+            payload.get("particle_size")
+            or payload.get("particleSize")
+            or payload.get("site_p80")
+        )
+        application_rate = (
+            payload.get("application_rate")
+            or payload.get("applicationRate")
+            or payload.get("site_app_rate_tha")
+        )
+        if particle_size is None:
+            return jsonify({"error": "particle_size is required"}), 400
+        if application_rate is None:
+            return jsonify({"error": "application_rate is required"}), 400
+
         spinup_name = spinup_name.strip()
         restart_name = restart_name.strip()
+
+        # Convert application_rate from ton/ha/yr to g/m²/yr (1 ton/ha = 100 g/m²)
+        application_rate_tha = float(application_rate)
+        application_rate_g_m2_yr = application_rate_tha * 100.0
+
+        # Optional: target_pH
+        params_extras = {
+            "particle_size": particle_size,
+            "application_rate": application_rate_g_m2_yr,  # g/m²/yr
+        }
+        if target_pH is not None and str(target_pH).strip():
+            params_extras["target_pH"] = target_pH
+        else:
+            params_extras["target_pH"] = "(not set)"
 
         timestamp = int(time.time())
         job_id = f"scepter_run_{str(timestamp)[-5:]}"
@@ -823,7 +862,11 @@ def submit_run_scepter_model():
             "bouchet_job_id": None,
             "job_folder": job_folder,
             "job_type": "scepter_run",
-            "parameters": {"spinup_name": spinup_name, "restart_name": restart_name},
+            "parameters": {
+                "spinup_name": spinup_name,
+                "restart_name": restart_name,
+                **params_extras,
+            },
             "status": "submitting",
             "submitted_at": time.time(),
         }
@@ -836,10 +879,21 @@ def submit_run_scepter_model():
                     current_app.logger.info(f"Starting SCEPTER run-model job {job_id}")
                     ssh = get_ssh_connection()
 
+                    params_data = {
+                        "spinup_name": spinup_name,
+                        "restart_name": restart_name,
+                        "particle_size": params_extras.get("particle_size"),
+                        "application_rate": params_extras.get(
+                            "application_rate"
+                        ),  # g/m²/yr
+                        "target_pH": params_extras.get("target_pH", "(not set)"),
+                    }
+                    params_json = json.dumps(params_data, indent=2)
                     commands = [
                         f"mkdir -p {job_folder}",
                         f"echo '{spinup_name}' > {job_folder}/spinup_name.txt",
                         f"echo '{restart_name}' > {job_folder}/restart_name.txt",
+                        f"cat > {job_folder}/parameters.json << 'PARAMS_EOF'\n{params_json}\nPARAMS_EOF",
                     ]
                     for cmd in commands:
                         stdin, stdout, stderr = ssh.exec_command(cmd)
@@ -939,6 +993,11 @@ exit $EXIT
                 "parameters": {
                     "spinup_name": spinup_name,
                     "restart_name": restart_name,
+                    "particle_size": params_extras.get("particle_size"),
+                    "application_rate": params_extras.get(
+                        "application_rate"
+                    ),  # g/m²/yr
+                    "target_pH": params_extras.get("target_pH"),
                 },
             }
         )
