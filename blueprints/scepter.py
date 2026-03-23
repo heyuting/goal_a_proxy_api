@@ -417,6 +417,127 @@ def check_baseline_simulation_status(job_id):
         return jsonify({"job_id": job_id, "status": "unknown", "error": str(e)}), 500
 
 
+@scepter_bp.route(
+    "/api/baseline-simulation/<job_id>/download", methods=["GET", "OPTIONS"]
+)
+def download_baseline_simulation_results(job_id):
+    """Download baseline simulation results as a zip file.
+
+    On Bouchet, baseline outputs live in the baseline_* job folder.
+    This endpoint zips the entire baseline_* folder rather than just the output subdirectory.
+    """
+    if request.method == "OPTIONS":
+        response = make_response()
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add(
+            "Access-Control-Allow-Headers",
+            "Content-Type, ngrok-skip-browser-warning, Authorization, X-Requested-With",
+        )
+        response.headers.add("Access-Control-Allow-Methods", "GET, OPTIONS")
+        response.headers.add("Access-Control-Max-Age", "3600")
+        return response, 200
+
+    try:
+        import io
+
+        job_info = JOB_STATUS_CACHE.get(job_id, {})
+        job_folder = job_info.get(
+            "job_folder",
+            f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/SCEPTER/jobs/{job_id}",
+        )
+
+        try:
+            ssh = get_ssh_connection_pooled()
+        except Exception as ssh_error:
+            error_msg = str(ssh_error)
+            current_app.logger.error(
+                f"SSH connection failed for baseline download {job_id}: {error_msg}"
+            )
+            if "Authentication failed" in error_msg or "Anomalous request" in error_msg:
+                return (
+                    jsonify(
+                        {
+                            "error": "Authentication failed. Please wait a minute and try again. Too many connection attempts may trigger security measures.",
+                            "job_id": job_id,
+                        }
+                    ),
+                    429,
+                )
+            return (
+                jsonify(
+                    {
+                        "error": f"Failed to connect to Bouchet HPC: {error_msg}",
+                        "job_id": job_id,
+                    }
+                ),
+                500,
+            )
+
+        # Create a zip of the baseline_* folder on Bouchet.
+        # This will work even if the job is still running; it zips whatever files exist.
+        parent_dir = os.path.dirname(job_folder.rstrip("/")) or "."
+        folder_name = os.path.basename(job_folder.rstrip("/"))
+        zip_cmd = f"cd {parent_dir} && zip -r {folder_name}.zip {folder_name}/ 2>&1"
+        stdin, stdout, stderr = ssh.exec_command(zip_cmd, timeout=120)
+        exit_status = stdout.channel.recv_exit_status()
+        zip_output = stdout.read().decode()
+        error_msg = stderr.read().decode()
+
+        if exit_status != 0:
+            current_app.logger.error(
+                f"Failed to create baseline zip for {job_id}: {error_msg or zip_output}"
+            )
+            return (
+                jsonify(
+                    {
+                        "error": f"Failed to create zip on Bouchet: {error_msg or zip_output}",
+                        "job_id": job_id,
+                    }
+                ),
+                500,
+            )
+
+        # Download the zip file over SFTP into memory
+        sftp = ssh.open_sftp()
+        zip_path = f"{parent_dir}/{folder_name}.zip"
+        remote_file = sftp.open(zip_path, "rb")
+        zip_data = remote_file.read()
+        remote_file.close()
+        sftp.close()
+
+        response = make_response(zip_data)
+        response.headers["Content-Type"] = "application/zip"
+        response.headers["Content-Disposition"] = (
+            f"attachment; filename={folder_name}.zip"
+        )
+        return response
+
+    except Exception as e:
+        error_msg = str(e)
+        current_app.logger.error(
+            f"Error in download_baseline_simulation_results for {job_id}: {error_msg}"
+        )
+        import traceback
+
+        current_app.logger.error(f"Traceback: {traceback.format_exc()}")
+
+        if "Authentication failed" in error_msg or "Anomalous request" in error_msg:
+            return (
+                jsonify(
+                    {
+                        "error": "Authentication failed. Please wait a minute and try again. Too many connection attempts may trigger security measures.",
+                        "job_id": job_id,
+                    }
+                ),
+                429,
+            )
+
+        return (
+            jsonify({"error": f"Failed to download baseline results: {error_msg}"}),
+            500,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Run SCEPTER model (restart_add_gbas.py)
 # ---------------------------------------------------------------------------
@@ -834,5 +955,141 @@ def check_run_scepter_model_status(job_id):
             f"Error in check_run_scepter_model_status for {job_id}: {str(e)}"
         )
         return jsonify({"job_id": job_id, "status": "unknown", "error": str(e)}), 500
+
+
+@scepter_bp.route(
+    "/api/run-scepter-model/<job_id>/download", methods=["GET", "OPTIONS"]
+)
+@scepter_bp.route(
+    "/api/scepter/run-model/<job_id>/download", methods=["GET", "OPTIONS"]
+)
+def download_run_scepter_model_results(job_id):
+    """Download SCEPTER run-model results as a zip file.
+
+    For ERW runs, outputs are organized under a restart_* folder.
+    This endpoint prefers zipping the restart_* folder (derived from restart_name)
+    and falls back to the job_folder (scepter_run_*) if needed.
+    """
+    if request.method == "OPTIONS":
+        response = make_response()
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add(
+            "Access-Control-Allow-Headers",
+            "Content-Type, ngrok-skip-browser-warning, Authorization, X-Requested-With",
+        )
+        response.headers.add("Access-Control-Allow-Methods", "GET, OPTIONS")
+        response.headers.add("Access-Control-Max-Age", "3600")
+        return response, 200
+
+    try:
+        job_info = JOB_STATUS_CACHE.get(job_id, {})
+        job_folder = job_info.get(
+            "job_folder",
+            f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/SCEPTER/jobs/{job_id}",
+        )
+        params = job_info.get("parameters", {})
+        restart_name = params.get("restart_name")
+
+        # Determine which folder to zip:
+        # - If we have a restart_name that looks like restart_*, prefer that folder.
+        # - Otherwise, fall back to the scepter_run_* job_folder.
+        jobs_base = os.path.dirname(job_folder.rstrip("/")) or "."
+        if isinstance(restart_name, str) and restart_name.strip():
+            target_folder_name = restart_name.strip()
+            target_folder_path = os.path.join(jobs_base, target_folder_name)
+        else:
+            target_folder_name = os.path.basename(job_folder.rstrip("/"))
+            target_folder_path = job_folder
+
+        try:
+            ssh = get_ssh_connection()
+        except Exception as ssh_error:
+            error_msg = str(ssh_error)
+            current_app.logger.error(
+                f"SSH connection failed for run-model download {job_id}: {error_msg}"
+            )
+            if "Authentication failed" in error_msg or "Anomalous request" in error_msg:
+                return (
+                    jsonify(
+                        {
+                            "error": "Authentication failed. Please wait a minute and try again. Too many connection attempts may trigger security measures.",
+                            "job_id": job_id,
+                        }
+                    ),
+                    429,
+                )
+            return (
+                jsonify(
+                    {
+                        "error": f"Failed to connect to Bouchet HPC: {error_msg}",
+                        "job_id": job_id,
+                    }
+                ),
+                500,
+            )
+
+        # Zip the restart_* folder if present, otherwise the scepter_run_* folder.
+        zip_parent = os.path.dirname(target_folder_path.rstrip("/")) or "."
+        zip_folder = os.path.basename(target_folder_path.rstrip("/"))
+        zip_cmd = f"cd {zip_parent} && zip -r {zip_folder}.zip {zip_folder}/ 2>&1"
+        stdin, stdout, stderr = ssh.exec_command(zip_cmd, timeout=120)
+        exit_status = stdout.channel.recv_exit_status()
+        zip_output = stdout.read().decode()
+        error_msg = stderr.read().decode()
+
+        if exit_status != 0:
+            current_app.logger.error(
+                f"Failed to create run-model zip for {job_id}: {error_msg or zip_output}"
+            )
+            return (
+                jsonify(
+                    {
+                        "error": f"Failed to create zip on Bouchet: {error_msg or zip_output}",
+                        "job_id": job_id,
+                    }
+                ),
+                500,
+            )
+
+        # Download the zip file into memory
+        sftp = ssh.open_sftp()
+        zip_path = f"{zip_parent}/{zip_folder}.zip"
+        remote_file = sftp.open(zip_path, "rb")
+        zip_data = remote_file.read()
+        remote_file.close()
+        sftp.close()
+        ssh.close()
+
+        response = make_response(zip_data)
+        response.headers["Content-Type"] = "application/zip"
+        response.headers["Content-Disposition"] = (
+            f"attachment; filename={zip_folder}.zip"
+        )
+        return response
+
+    except Exception as e:
+        error_msg = str(e)
+        current_app.logger.error(
+            f"Error in download_run_scepter_model_results for {job_id}: {error_msg}"
+        )
+        import traceback
+
+        current_app.logger.error(f"Traceback: {traceback.format_exc()}")
+
+        if "Authentication failed" in error_msg or "Anomalous request" in error_msg:
+            return (
+                jsonify(
+                    {
+                        "error": "Authentication failed. Please wait a minute and try again. Too many connection attempts may trigger security measures.",
+                        "job_id": job_id,
+                    }
+                ),
+                429,
+            )
+
+        return (
+            jsonify({"error": f"Failed to download run-model results: {error_msg}"}),
+            500,
+        )
 
 

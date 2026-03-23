@@ -316,7 +316,140 @@ Fetches watershed results.
 
 ## SCEPTER Model Endpoints
 
-### Full Pipeline Operations
+### Baseline Simulation (Spinup)
+
+#### POST `/api/baseline-simulation`
+
+Submits a baseline SCEPTER spinup job on Bouchet.
+
+**Request Body:**
+
+```json
+{
+  "coordinate": [lat, lon],
+  "location_name": "optional descriptive name"
+}
+```
+
+**Response:**
+
+```json
+{
+  "job_id": "baseline_12345",
+  "bouchet_job_id": null,
+  "status": "submitting",
+  "message": "Baseline simulation job is being submitted. Job ID: baseline_12345.",
+  "parameters": {
+    "coordinate": [lat, lon]
+  }
+}
+```
+
+**Location:** `blueprints/scepter.py:24`
+
+---
+
+#### GET `/api/baseline-simulation/{jobId}/status`
+
+Checks the status of a baseline spinup job.
+
+**Response:**
+
+```json
+{
+  "job_id": "baseline_12345",
+  "bouchet_job_id": "67890",
+  "status": "pending" | "running" | "completed" | "failed" | "unknown",
+  "submitted_at": 1234567890.123,
+  "logs": ["..."]
+}
+```
+
+**Location:** `blueprints/scepter.py:256`
+
+---
+
+#### GET `/api/baseline-simulation/{jobId}/download`
+
+Downloads all available baseline spinup outputs (the `output/` folder under the job directory) as a ZIP file.
+
+**Response:** ZIP file blob (binary)
+
+**Location:** `blueprints/scepter.py:259`
+
+---
+
+### Run-Model Operations (restart_add_gbas)
+
+#### POST `/api/run-scepter-model`
+
+Submits a SCEPTER run-model job using an existing spinup.
+
+**Request Body:**
+
+```json
+{
+  "spinup_name": "baseline_12345",
+  "restart_name": "my_restart",
+  "particle_size": 320,
+  "application_rate": 1.0,   // t/ha/yr
+  "target_pH": 7.0           // optional
+}
+```
+
+**Response:**
+
+```json
+{
+  "job_id": "scepter_run_12345",
+  "bouchet_job_id": null,
+  "status": "submitting",
+  "message": "SCEPTER model run is being submitted. Job ID: scepter_run_12345.",
+  "parameters": {
+    "spinup_name": "baseline_12345",
+    "restart_name": "my_restart",
+    "particle_size": 320,
+    "application_rate": 100.0,
+    "target_pH": "(not set)"
+  }
+}
+```
+
+**Location:** `blueprints/scepter.py:425`
+
+---
+
+#### GET `/api/run-scepter-model/{jobId}/status`
+
+Checks the status of a SCEPTER run-model job.
+
+**Response:**
+
+```json
+{
+  "job_id": "scepter_run_12345",
+  "bouchet_job_id": "67890",
+  "status": "pending" | "running" | "completed" | "failed" | "unknown",
+  "submitted_at": 1234567890.123,
+  "logs": ["..."]
+}
+```
+
+**Location:** `blueprints/scepter.py:693`
+
+---
+
+#### GET `/api/run-scepter-model/{jobId}/download`
+
+Downloads a ZIP of the job folder for a run-model job (logs, parameters, and any helper files produced under the job directory).
+
+**Response:** ZIP file blob (binary)
+
+**Location:** `blueprints/scepter.py:699`
+
+---
+
+### (Legacy) Full Pipeline Operations
 
 #### POST `/api/scepter/full-pipeline`
 
