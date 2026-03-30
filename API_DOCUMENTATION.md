@@ -353,6 +353,10 @@ Submits a baseline SCEPTER spinup job on Bouchet.
 
 Checks the status of a baseline spinup job.
 
+Alias: `GET /api/scepter/baseline-simulation/{jobId}/status`.
+
+For batch spinups, job folders live under `jobs/baseline_batch_*/{jobId}`; the handler resolves that from cache or discovers the path on Bouchet if needed.
+
 **Response:**
 
 ```json
@@ -373,9 +377,99 @@ Checks the status of a baseline spinup job.
 
 Downloads all available baseline spinup outputs (the `output/` folder under the job directory) as a ZIP file.
 
+Alias: `GET /api/scepter/baseline-simulation/{jobId}/download`.
+
 **Response:** ZIP file blob (binary)
 
 **Location:** `blueprints/scepter.py:259`
+
+---
+
+### Baseline Simulation Batch (Multiple Locations)
+
+#### POST `/api/baseline-simulation-batch`
+
+Submits baseline spinup jobs for multiple locations. Each location is submitted as a **separate SLURM job** on the HPC.
+All per-location job folders are grouped under one batch parent folder: `jobs/baseline_batch_*`.
+
+**Request Body:**
+
+```json
+{
+  "coordinates": [
+    [41.31, -72.93],
+    [42.36, -71.06]
+  ],
+  "location_names": ["new_haven", "boston"]
+}
+```
+
+**Response:**
+
+```json
+{
+  "batch_id": "baseline_batch_123456",
+  "job_ids": ["baseline_12345_0", "baseline_12345_1"],
+  "status": "submitting",
+  "message": "Submitting 2 baseline simulation job(s). Each location is a separate SLURM job.",
+  "location_count": 2
+}
+```
+
+**Location:** `blueprints/scepter.py`
+
+---
+
+#### GET `/api/baseline-simulation-batch/{batchId}/status`
+
+Checks the status of all baseline jobs in a batch.
+
+This endpoint **does not** call Bouchet: it only aggregates **`overall`**, **`jobs[].status`**, and **`status_counts`** from the server’s in-memory cache (`JOB_STATUS_CACHE`) filled at submit time and updated when clients call **`GET /api/baseline-simulation/{jobId}/status`** (or aliases). For live SLURM state, poll each `job_id` with the per-job status route.
+
+`{batchId}` can be the full id from the batch submit response (`baseline_batch_…`), a bare numeric suffix (`887986` → `baseline_batch_887986`), or any per-location job id from that batch (`baseline_<ts>_<index>`). The batch must still be known to this server process; after a restart, re-submit the batch or use per-job folders on disk.
+
+**Response:**
+
+```json
+{
+  "batch_id": "baseline_batch_123456",
+  "overall": "running",
+  "jobs": [
+    {
+      "job_id": "baseline_12345_0",
+      "status": "running",
+      "bouchet_job_id": "90001"
+    },
+    {
+      "job_id": "baseline_12345_1",
+      "status": "completed",
+      "bouchet_job_id": "90002"
+    }
+  ],
+  "status_counts": {
+    "completed": 1,
+    "running": 1,
+    "pending": 0,
+    "failed": 0,
+    "submitting": 0,
+    "submitted": 0,
+    "unknown": 0
+  },
+  "submitted_at": 1234567890.123
+}
+```
+
+**Location:** `blueprints/scepter.py`
+
+---
+
+#### GET `/api/baseline-simulation-batch/{batchId}/download`
+
+Downloads the entire baseline batch folder (`baseline_batch_*`) as a ZIP file, including all per-location job folders and `manifest.json`.
+
+**Response:** ZIP file blob (binary)
+
+**Location:** `blueprints/scepter.py`
 
 ---
 
@@ -392,8 +486,8 @@ Submits a SCEPTER run-model job using an existing spinup.
   "spinup_name": "baseline_12345",
   "restart_name": "my_restart",
   "particle_size": 320,
-  "application_rate": 1.0,   // t/ha/yr
-  "target_pH": 7.0           // optional
+  "application_rate": 1.0, // t/ha/yr
+  "target_pH": 7.0 // optional
 }
 ```
 
@@ -446,6 +540,98 @@ Downloads a ZIP of the job folder for a run-model job (logs, parameters, and any
 **Response:** ZIP file blob (binary)
 
 **Location:** `blueprints/scepter.py:699`
+
+---
+
+### Run-Model Batch (Multiple Locations)
+
+#### POST `/api/run-scepter-model-batch`
+
+Submits SCEPTER run-model jobs for multiple locations. Each location is submitted as a **separate SLURM job** on the HPC.
+
+**Request Body:**
+
+```json
+{
+  "locations": [
+    {
+      "spinup_name": "baseline_12345",
+      "restart_name": "restart_loc1",
+      "particle_size": 320,
+      "application_rate": 1.0,
+      "target_pH": 7.0
+    },
+    {
+      "spinup_name": "baseline_12345",
+      "restart_name": "restart_loc2",
+      "particle_size": 320,
+      "application_rate": 1.0
+    }
+  ]
+}
+```
+
+**Response:**
+
+```json
+{
+  "batch_id": "scepter_batch_123456",
+  "job_ids": ["scepter_run_12345_0", "scepter_run_12345_1"],
+  "status": "submitting",
+  "message": "Submitting 2 SCEPTER model run(s). Each location is a separate SLURM job.",
+  "location_count": 2
+}
+```
+
+**Location:** `blueprints/scepter.py`
+
+---
+
+#### GET `/api/run-scepter-model-batch/{batchId}/status`
+
+Checks the status of all jobs in a batch.
+
+On every request, each job’s state is **recomputed on Bouchet** (same rules as `GET /api/run-scepter-model/{jobId}/status`), the cache is updated, and **`overall`**, **`jobs[].status`**, and **`status_counts`** reflect those values. If SSH fails, the endpoint returns **500**.
+
+**Response:**
+
+```json
+{
+  "batch_id": "scepter_batch_123456",
+  "overall": "running",
+  "jobs": [
+    {
+      "job_id": "scepter_run_12345_0",
+      "status": "completed",
+      "bouchet_job_id": "67890"
+    },
+    {
+      "job_id": "scepter_run_12345_1",
+      "status": "running",
+      "bouchet_job_id": "67891"
+    }
+  ],
+  "status_counts": {
+    "completed": 1,
+    "running": 1,
+    "pending": 0,
+    "failed": 0,
+    "submitting": 0,
+    "submitted": 0,
+    "unknown": 0
+  },
+  "submitted_at": 1234567890.123
+}
+```
+
+**Location:** `blueprints/scepter.py`
+
+---
+
+Individual job status and download use the existing single-job endpoints:
+
+- `GET /api/run-scepter-model/{jobId}/status` – per-location status
+- `GET /api/run-scepter-model/{jobId}/download` – per-location download
 
 ---
 
