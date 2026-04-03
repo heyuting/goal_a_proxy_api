@@ -12,6 +12,9 @@ build/
 develop-eggs/
 dist/
 downloads/
+
+# SCEPTER batch metadata (local paths / job ids; optional to commit)
+scepter_batch_registry.json
 eggs/
 .eggs/
 lib/

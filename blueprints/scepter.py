@@ -4,6 +4,7 @@ Uses spinup + restart flow (no standalone pipeline).
 """
 
 from flask import Blueprint, request, jsonify, make_response, current_app
+import logging
 import os
 import json
 import time
@@ -15,6 +16,82 @@ from utils.ssh import get_ssh_connection, get_ssh_connection_pooled, BOUCHET_USE
 scepter_bp = Blueprint("scepter", __name__)
 JOB_STATUS_CACHE = {}  # job_id -> { job_id, bouchet_job_id, job_folder, status, ... }
 BATCH_JOB_CACHE = {}  # batch_id -> { batch_id, job_ids: [...], submitted_at }
+
+_scepter_log = logging.getLogger(__name__)
+_SCEPTER_REGISTRY_LOCK = threading.Lock()
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _scepter_batch_registry_path():
+    p = os.getenv("SCEPTER_BATCH_REGISTRY")
+    if p:
+        return os.path.abspath(p)
+    return os.path.join(_PROJECT_ROOT, "scepter_batch_registry.json")
+
+
+def _load_scepter_batch_registry():
+    """Restore batch metadata after API restart (BATCH_JOB_CACHE is in-memory only)."""
+    path = _scepter_batch_registry_path()
+    if not os.path.isfile(path):
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return
+        with _SCEPTER_REGISTRY_LOCK:
+            for bid, rec in data.items():
+                if isinstance(rec, dict) and isinstance(bid, str):
+                    BATCH_JOB_CACHE[bid] = rec
+    except Exception as e:
+        _scepter_log.warning("Could not load SCEPTER batch registry %s: %s", path, e)
+
+
+def _persist_scepter_batch_record(batch_id, record):
+    """Append/update one batch in the on-disk registry."""
+    path = _scepter_batch_registry_path()
+    slim = {
+        "batch_id": record.get("batch_id") or batch_id,
+        "job_ids": list(record.get("job_ids") or []),
+        "submitted_at": record.get("submitted_at"),
+        "job_type": record.get("job_type") or "unknown",
+    }
+    if record.get("batch_folder"):
+        slim["batch_folder"] = record["batch_folder"]
+    try:
+        with _SCEPTER_REGISTRY_LOCK:
+            data = {}
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict):
+                    data = {}
+            data[batch_id] = slim
+            parent = os.path.dirname(path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, path)
+    except Exception as e:
+        _scepter_log.warning("Could not persist SCEPTER batch registry %s: %s", path, e)
+
+
+_load_scepter_batch_registry()
+
+
+def _find_baseline_batch_for_member(job_id):
+    """Resolve batch_id from a per-location baseline job_id using the registry/cache."""
+    for bid, rec in BATCH_JOB_CACHE.items():
+        if not str(bid).startswith("baseline_batch_"):
+            continue
+        jt = rec.get("job_type")
+        if jt is not None and jt != "baseline":
+            continue
+        if job_id in (rec.get("job_ids") or []):
+            return bid
+    return None
 
 
 def _resolve_baseline_batch_id(batch_id):
@@ -41,9 +118,12 @@ def _resolve_baseline_batch_id(batch_id):
         nested = info.get("batch_id")
         if nested and nested in BATCH_JOB_CACHE:
             return nested, None
+        reg = _find_baseline_batch_for_member(bid)
+        if reg:
+            return reg, None
         return None, (
-            f"No in-memory batch for job {bid}. Use the full batch_id from the "
-            "batch submit response, or restart the API submit flow (cache clears on server restart)."
+            f"No batch found for job {bid}. Use the batch_id from the submit response, "
+            "or ensure scepter_batch_registry.json is present if the API was restarted."
         )
 
     # Bare numeric suffix only: 887986 -> baseline_batch_887986
@@ -683,6 +763,7 @@ def submit_baseline_simulation_batch():
             "job_type": "baseline",
             "batch_folder": batch_folder,
         }
+        _persist_scepter_batch_record(batch_id, BATCH_JOB_CACHE[batch_id])
 
         app = current_app._get_current_object()
 
@@ -959,20 +1040,8 @@ def download_baseline_simulation_batch_results(batch_id):
             return jsonify({"error": "Invalid batch_id", "batch_id": batch_id}), 400
 
         batch_info = BATCH_JOB_CACHE.get(resolved, {})
-        if not batch_info.get("job_ids"):
-            return (
-                jsonify(
-                    {
-                        "error": "Batch not found in server memory.",
-                        "batch_id": resolved,
-                    }
-                ),
-                404,
-            )
-
-        batch_folder = batch_info.get(
-            "batch_folder",
-            f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/SCEPTER/jobs/{resolved}",
+        batch_folder = batch_info.get("batch_folder") or (
+            f"{_baseline_jobs_root()}/{resolved}"
         )
 
         try:
@@ -1000,6 +1069,20 @@ def download_baseline_simulation_batch_results(batch_id):
                     }
                 ),
                 500,
+            )
+
+        chk = f"test -d {batch_folder} && echo ok || echo missing"
+        stdin, stdout, stderr = ssh.exec_command(chk)
+        if stdout.read().decode().strip() != "ok":
+            return (
+                jsonify(
+                    {
+                        "error": "Batch folder not found on Bouchet",
+                        "batch_id": resolved,
+                        "batch_folder": batch_folder,
+                    }
+                ),
+                404,
             )
 
         parent_dir = os.path.dirname(batch_folder.rstrip("/")) or "."
@@ -1814,7 +1897,9 @@ def submit_run_scepter_model_batch():
             "batch_id": batch_id,
             "job_ids": job_ids,
             "submitted_at": time.time(),
+            "job_type": "scepter_run",
         }
+        _persist_scepter_batch_record(batch_id, BATCH_JOB_CACHE[batch_id])
 
         app = current_app._get_current_object()
 

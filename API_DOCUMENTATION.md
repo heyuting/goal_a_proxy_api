@@ -387,6 +387,8 @@ Alias: `GET /api/scepter/baseline-simulation/{jobId}/download`.
 
 ### Baseline Simulation Batch (Multiple Locations)
 
+**Batch registry (survives API restarts):** Each batch’s `batch_id`, `job_ids`, `batch_folder`, and `submitted_at` are appended to a JSON file on the API host: default `scepter_batch_registry.json` in the project root. Override with env **`SCEPTER_BATCH_REGISTRY`** (absolute path). On startup the API reloads this file into `BATCH_JOB_CACHE`. Per-job SLURM status is still only as fresh as `JOB_STATUS_CACHE` (poll **`GET /api/baseline-simulation/{jobId}/status`** to refresh). Batch **download** only needs a valid `baseline_batch_*` id and the folder on Bouchet (`jobs/<batch_id>/`).
+
 #### POST `/api/baseline-simulation-batch`
 
 Submits baseline spinup jobs for multiple locations. Each location is submitted as a **separate SLURM job** on the HPC.
@@ -426,7 +428,7 @@ Checks the status of all baseline jobs in a batch.
 
 This endpoint **does not** call Bouchet: it only aggregates **`overall`**, **`jobs[].status`**, and **`status_counts`** from the server’s in-memory cache (`JOB_STATUS_CACHE`) filled at submit time and updated when clients call **`GET /api/baseline-simulation/{jobId}/status`** (or aliases). For live SLURM state, poll each `job_id` with the per-job status route.
 
-`{batchId}` can be the full id from the batch submit response (`baseline_batch_…`), a bare numeric suffix (`887986` → `baseline_batch_887986`), or any per-location job id from that batch (`baseline_<ts>_<index>`). The batch must still be known to this server process; after a restart, re-submit the batch or use per-job folders on disk.
+`{batchId}` can be the full id from the batch submit response (`baseline_batch_…`), a bare numeric suffix (`887986` → `baseline_batch_887986`), or any per-location job id from that batch (`baseline_<ts>_<index>`) if that job is listed in the batch registry. After a restart, batch metadata is restored from **`scepter_batch_registry.json`** (or **`SCEPTER_BATCH_REGISTRY`**).
 
 **Response:**
 
@@ -465,7 +467,7 @@ This endpoint **does not** call Bouchet: it only aggregates **`overall`**, **`jo
 
 #### GET `/api/baseline-simulation-batch/{batchId}/download`
 
-Downloads the entire baseline batch folder (`baseline_batch_*`) as a ZIP file, including all per-location job folders and `manifest.json`.
+Downloads the entire baseline batch folder (`baseline_batch_*`) as a ZIP file, including all per-location job folders and `manifest.json`. Uses `batch_folder` from the registry when present; otherwise **`…/SCEPTER/jobs/<batch_id>/`** on Bouchet, then checks that the directory exists.
 
 **Response:** ZIP file blob (binary)
 
@@ -544,6 +546,8 @@ Downloads a ZIP of the job folder for a run-model job (logs, parameters, and any
 ---
 
 ### Run-Model Batch (Multiple Locations)
+
+Run-model batches are recorded in the same **`scepter_batch_registry.json`** / **`SCEPTER_BATCH_REGISTRY`** file as baseline batches (`job_type`: `scepter_run`) so **`GET /api/run-scepter-model-batch/{batchId}/status`** still works after an API restart.
 
 #### POST `/api/run-scepter-model-batch`
 
