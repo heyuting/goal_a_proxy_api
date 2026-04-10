@@ -481,17 +481,27 @@ Downloads the entire baseline batch folder (`baseline_batch_*`) as a ZIP file, i
 
 Submits a SCEPTER run-model job using an existing spinup.
 
+On Bouchet, `restart_add_gbas.py` resolves the spinup under **`SCEPTER/jobs/<path>`**. A standalone baseline job uses a path like `baseline_12345_0`. Outputs from **`POST /api/baseline-simulation-batch`** live under **`jobs/<baseline_batch_id>/<baseline_*_*>`** (for example `baseline_batch_895903/baseline_95903_0`). For those runs you must either:
+
+- pass **`spinup_name`** as that relative path (`"baseline_batch_895903/baseline_95903_0"`), or  
+- pass only the member id (e.g. `"baseline_95903_0"`) and optionally **`spinup_batch_id`** / **`baseline_batch_id`** (aliases **`spinupBatchId`** / **`baselineBatchId`**) as `baseline_batch_895903`.
+
+If **`spinup_batch_id`** is omitted, the API may still resolve the batch from the in-memory job cache (same session) or from **`scepter_batch_registry.json`** when the baseline batch was recorded there.
+
 **Request Body:**
 
 ```json
 {
-  "spinup_name": "baseline_12345",
+  "spinup_name": "baseline_12345_0",
+  "spinup_batch_id": "baseline_batch_895903",
   "restart_name": "my_restart",
   "particle_size": 320,
-  "application_rate": 1.0, // t/ha/yr
-  "target_pH": 7.0 // optional
+  "application_rate": 1.0,
+  "target_pH": 7.0
 }
 ```
+
+- **`spinup_batch_id`** (or **`baseline_batch_id`**, camelCase variants): optional; used when **`spinup_name`** has no `/` and names a batch member folder.
 
 **Response:**
 
@@ -502,7 +512,8 @@ Submits a SCEPTER run-model job using an existing spinup.
   "status": "submitting",
   "message": "SCEPTER model run is being submitted. Job ID: scepter_run_12345.",
   "parameters": {
-    "spinup_name": "baseline_12345",
+    "spinup_name": "baseline_95903_0",
+    "spinup_for_restart": "baseline_batch_895903/baseline_95903_0",
     "restart_name": "my_restart",
     "particle_size": 320,
     "application_rate": 100.0,
@@ -511,7 +522,9 @@ Submits a SCEPTER run-model job using an existing spinup.
 }
 ```
 
-**Location:** `blueprints/scepter.py:425`
+**`spinup_for_restart`** is the path segment written to **`spinup_name.txt`** and passed to **`restart_add_gbas.py`**; **`spinup_name`** remains the logical baseline job id for display and cache lookup.
+
+**Location:** `blueprints/scepter.py`
 
 ---
 
@@ -555,18 +568,21 @@ Submits SCEPTER run-model jobs for multiple locations. Each location is submitte
 
 **Request Body:**
 
+Per-location objects support the same **`spinup_batch_id`** / **`baseline_batch_id`** (and camelCase) fields as **`POST /api/run-scepter-model`**. You can also set **`spinup_name`** to a path containing **`/`** (e.g. `baseline_batch_895903/baseline_95903_0`).
+
 ```json
 {
   "locations": [
     {
-      "spinup_name": "baseline_12345",
+      "spinup_name": "baseline_12345_0",
+      "spinup_batch_id": "baseline_batch_895903",
       "restart_name": "restart_loc1",
       "particle_size": 320,
       "application_rate": 1.0,
       "target_pH": 7.0
     },
     {
-      "spinup_name": "baseline_12345",
+      "spinup_name": "baseline_batch_895903/baseline_95903_1",
       "restart_name": "restart_loc2",
       "particle_size": 320,
       "application_rate": 1.0

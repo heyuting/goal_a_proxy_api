@@ -9,6 +9,7 @@ import os
 import json
 import time
 import re
+import shlex
 import threading
 
 from utils.ssh import get_ssh_connection, get_ssh_connection_pooled, BOUCHET_USER
@@ -92,6 +93,28 @@ def _find_baseline_batch_for_member(job_id):
         if job_id in (rec.get("job_ids") or []):
             return bid
     return None
+
+
+def _effective_spinup_for_restart(spinup_name, spinup_batch_id=None):
+    """
+    restart_add_gbas looks for spinup under SCEPTER/jobs/<spinup_name>.
+    Batch baseline outputs live at jobs/<baseline_batch_*>/<baseline_*_i>/,
+    so pass spinup_name as baseline_batch_xxx/baseline_yyy_i (POSIX path under jobs/).
+    """
+    s = (spinup_name or "").strip()
+    if not s or "/" in s:
+        return s
+    bid = None
+    if spinup_batch_id:
+        bid = str(spinup_batch_id).strip().strip("/")
+    if not bid:
+        info = JOB_STATUS_CACHE.get(s, {})
+        bid = info.get("batch_id")
+    if not bid:
+        bid = _find_baseline_batch_for_member(s)
+    if bid:
+        return f"{bid}/{s}"
+    return s
 
 
 def _resolve_baseline_batch_id(batch_id):
@@ -1528,6 +1551,15 @@ def submit_run_scepter_model():
 
         spinup_name = spinup_name.strip()
         restart_name = restart_name.strip()
+        spinup_batch_id = (
+            payload.get("spinup_batch_id")
+            or payload.get("baseline_batch_id")
+            or payload.get("spinupBatchId")
+            or payload.get("baselineBatchId")
+        )
+        spinup_for_restart = _effective_spinup_for_restart(
+            spinup_name, spinup_batch_id=spinup_batch_id
+        )
 
         # Convert application_rate from ton/ha/yr to g/m²/yr (1 ton/ha = 100 g/m²)
         application_rate_tha = float(application_rate)
@@ -1558,6 +1590,7 @@ def submit_run_scepter_model():
             "job_type": "scepter_run",
             "parameters": {
                 "spinup_name": spinup_name,
+                "spinup_for_restart": spinup_for_restart,
                 "restart_name": restart_name,
                 **params_extras,
             },
@@ -1575,6 +1608,7 @@ def submit_run_scepter_model():
 
                     params_data = {
                         "spinup_name": spinup_name,
+                        "spinup_for_restart": spinup_for_restart,
                         "restart_name": restart_name,
                         "particle_size": params_extras.get("particle_size"),
                         "application_rate": params_extras.get(
@@ -1585,7 +1619,7 @@ def submit_run_scepter_model():
                     params_json = json.dumps(params_data, indent=2)
                     commands = [
                         f"mkdir -p {job_folder}",
-                        f"echo '{spinup_name}' > {job_folder}/spinup_name.txt",
+                        f"echo '{spinup_for_restart}' > {job_folder}/spinup_name.txt",
                         f"echo '{restart_name}' > {job_folder}/restart_name.txt",
                         f"cat > {job_folder}/parameters.json << 'PARAMS_EOF'\n{params_json}\nPARAMS_EOF",
                     ]
@@ -1599,6 +1633,9 @@ def submit_run_scepter_model():
                             )
                             return
 
+                    scepter_jobs_dir = f"{scepter_path.rstrip('/')}/jobs/"
+                    restart_dir_full = f"{job_folder.rstrip('/')}/{restart_name}"
+
                     sbatch_script = f"""#!/bin/bash
 #SBATCH --job-name={job_id[:12]}
 #SBATCH --ntasks=1
@@ -1610,6 +1647,9 @@ def submit_run_scepter_model():
 
 set -x
 cd {scepter_path}
+
+export SCEPTER_JOBS_DIR={shlex.quote(scepter_jobs_dir)}
+export SCEPTER_RESTART_DIR={shlex.quote(restart_dir_full)}
 
 # Use a venv with numpy if present (restart_add_gbas.py needs numpy)
 for venv_path in ".venv" "venv" "../venv"; do
@@ -1624,7 +1664,7 @@ for venv_path in ".venv" "venv" "../venv"; do
     fi
 done
 
-python3 {restart_script} {spinup_name} {restart_name}
+python3 {restart_script} {spinup_for_restart} {restart_name}
 EXIT=$?
 if [ $EXIT -eq 0 ]; then
     echo "Job completed at $(date)" > {job_folder}/.completed
@@ -1700,6 +1740,7 @@ exit $EXIT
                 "message": f"SCEPTER model run is being submitted. Job ID: {job_id}.",
                 "parameters": {
                     "spinup_name": spinup_name,
+                    "spinup_for_restart": spinup_for_restart,
                     "restart_name": restart_name,
                     "particle_size": params_extras.get("particle_size"),
                     "application_rate": params_extras.get(
@@ -1759,13 +1800,23 @@ def submit_run_scepter_model_batch():
             )
 
         payload = request.get_json(silent=True) or {}
-        locations = payload.get("locations") or payload.get("sites")
+        locations = (
+            payload.get("locations")
+            or payload.get("sites")
+            or payload.get("location")
+        )
 
         if not locations or not isinstance(locations, list) or len(locations) == 0:
+            current_app.logger.warning(
+                "run-scepter-model-batch 400: missing or empty locations/sites/location array; "
+                "keys=%s",
+                list(payload.keys()) if isinstance(payload, dict) else "n/a",
+            )
             return (
                 jsonify(
                     {
-                        "error": "locations array is required with at least one location (spinup_name, restart_name, particle_size, application_rate)"
+                        "error": "locations array is required with at least one location (spinup_name, restart_name, particle_size, application_rate)",
+                        "hint": "Send JSON body key 'locations' (or 'sites') as an array of objects.",
                     }
                 ),
                 400,
@@ -1803,6 +1854,9 @@ def submit_run_scepter_model_batch():
             )
 
             if not spinup_name:
+                current_app.logger.warning(
+                    "run-scepter-model-batch 400: location %s missing spinup_name", i
+                )
                 return (
                     jsonify(
                         {
@@ -1813,6 +1867,9 @@ def submit_run_scepter_model_batch():
                     400,
                 )
             if not restart_name:
+                current_app.logger.warning(
+                    "run-scepter-model-batch 400: location %s missing restart_name", i
+                )
                 return (
                     jsonify(
                         {"error": f"Location {i}: restart_name is required", "index": i}
@@ -1820,6 +1877,9 @@ def submit_run_scepter_model_batch():
                     400,
                 )
             if particle_size is None:
+                current_app.logger.warning(
+                    "run-scepter-model-batch 400: location %s missing particle_size", i
+                )
                 return (
                     jsonify(
                         {
@@ -1830,6 +1890,10 @@ def submit_run_scepter_model_batch():
                     400,
                 )
             if application_rate is None:
+                current_app.logger.warning(
+                    "run-scepter-model-batch 400: location %s missing application_rate",
+                    i,
+                )
                 return (
                     jsonify(
                         {
@@ -1842,6 +1906,16 @@ def submit_run_scepter_model_batch():
 
             application_rate_tha = float(application_rate)
             application_rate_g_m2_yr = application_rate_tha * 100.0
+
+            spinup_batch_id = (
+                loc.get("spinup_batch_id")
+                or loc.get("baseline_batch_id")
+                or loc.get("spinupBatchId")
+                or loc.get("baselineBatchId")
+            )
+            spinup_for_restart = _effective_spinup_for_restart(
+                spinup_name, spinup_batch_id=spinup_batch_id
+            )
 
             job_id = f"scepter_run_{str(timestamp)[-5:]}_{i}"
             job_folder = (
@@ -1869,6 +1943,7 @@ def submit_run_scepter_model_batch():
                     "job_id": job_id,
                     "job_folder": job_folder,
                     "spinup_name": spinup_name,
+                    "spinup_for_restart": spinup_for_restart,
                     "restart_name": restart_name,
                     "params_extras": params_extras,
                     "p80str": p80str,
@@ -1886,6 +1961,7 @@ def submit_run_scepter_model_batch():
                 "job_type": "scepter_run",
                 "parameters": {
                     "spinup_name": spinup_name,
+                    "spinup_for_restart": spinup_for_restart,
                     "restart_name": restart_name,
                     **params_extras,
                 },
@@ -1915,6 +1991,7 @@ def submit_run_scepter_model_batch():
                             )
                             params_data = {
                                 "spinup_name": cfg["spinup_name"],
+                                "spinup_for_restart": cfg["spinup_for_restart"],
                                 "restart_name": cfg["restart_name"],
                                 "particle_size": cfg["params_extras"].get(
                                     "particle_size"
@@ -1930,7 +2007,7 @@ def submit_run_scepter_model_batch():
                             job_folder = cfg["job_folder"]
                             commands = [
                                 f"mkdir -p {job_folder}",
-                                f"echo '{cfg['spinup_name']}' > {job_folder}/spinup_name.txt",
+                                f"echo '{cfg['spinup_for_restart']}' > {job_folder}/spinup_name.txt",
                                 f"echo '{cfg['restart_name']}' > {job_folder}/restart_name.txt",
                                 f"cat > {job_folder}/parameters.json << 'PARAMS_EOF'\n{params_json}\nPARAMS_EOF",
                             ]
@@ -1942,6 +2019,13 @@ def submit_run_scepter_model_batch():
                                         {"status": "failed", "error": err}
                                     )
                                     continue
+
+                            scepter_jobs_dir = (
+                                f"{cfg['scepter_path'].rstrip('/')}/jobs/"
+                            )
+                            restart_dir_full = (
+                                f"{job_folder.rstrip('/')}/{cfg['restart_name']}"
+                            )
 
                             sbatch_script = f"""#!/bin/bash
 #SBATCH --job-name={cfg['job_id'][:12]}
@@ -1955,6 +2039,9 @@ def submit_run_scepter_model_batch():
 set -x
 cd {cfg['scepter_path']}
 
+export SCEPTER_JOBS_DIR={shlex.quote(scepter_jobs_dir)}
+export SCEPTER_RESTART_DIR={shlex.quote(restart_dir_full)}
+
 for venv_path in ".venv" "venv" "../venv"; do
     if [ -f "$venv_path/bin/activate" ]; then
         if "$venv_path/bin/python" -c "import numpy" 2>/dev/null; then
@@ -1967,7 +2054,7 @@ for venv_path in ".venv" "venv" "../venv"; do
     fi
 done
 
-python3 {cfg['restart_script']} {cfg['spinup_name']} {cfg['restart_name']} {cfg['p80str']} {cfg['fdust']}{' ' + cfg['target_pH_arg'] if cfg.get('target_pH_arg') else ''}
+python3 {cfg['restart_script']} {cfg['spinup_for_restart']} {cfg['restart_name']} {cfg['p80str']} {cfg['fdust']}{' ' + cfg['target_pH_arg'] if cfg.get('target_pH_arg') else ''}
 EXIT=$?
 if [ $EXIT -eq 0 ]; then
     echo "Job completed at $(date)" > {job_folder}/.completed
@@ -2326,16 +2413,12 @@ def download_run_scepter_model_results(job_id):
         params = job_info.get("parameters", {})
         restart_name = params.get("restart_name")
 
-        # Determine which folder to zip:
-        # - If we have a restart_name that looks like restart_*, prefer that folder.
-        # - Otherwise, fall back to the scepter_run_* job_folder.
+        # Zip restart outputs: prefer .../scepter_run_*/<restart_name>/ (after post-job mv),
+        # else legacy .../jobs/<restart_name>/ beside the run folder.
         jobs_base = os.path.dirname(job_folder.rstrip("/")) or "."
-        if isinstance(restart_name, str) and restart_name.strip():
-            target_folder_name = restart_name.strip()
-            target_folder_path = os.path.join(jobs_base, target_folder_name)
-        else:
-            target_folder_name = os.path.basename(job_folder.rstrip("/"))
-            target_folder_path = job_folder
+        rn = restart_name.strip() if isinstance(restart_name, str) else ""
+        in_job = os.path.join(job_folder, rn) if rn else None
+        sibling = os.path.join(jobs_base, rn) if rn else None
 
         try:
             ssh = get_ssh_connection()
@@ -2364,7 +2447,24 @@ def download_run_scepter_model_results(job_id):
                 500,
             )
 
-        # Zip the restart_* folder if present, otherwise the scepter_run_* folder.
+        if in_job is not None and sibling is not None:
+            pick_cmd = (
+                f"if [ -d {shlex.quote(in_job)} ]; then echo in_job; "
+                f"elif [ -d {shlex.quote(sibling)} ]; then echo sibling; "
+                f"else echo missing; fi"
+            )
+            stdin, stdout, stderr = ssh.exec_command(pick_cmd)
+            pick = (stdout.read().decode() or "").strip()
+            if pick == "in_job":
+                target_folder_path = in_job
+            elif pick == "sibling":
+                target_folder_path = sibling
+            else:
+                target_folder_path = job_folder
+        else:
+            target_folder_path = job_folder
+
+        # Zip the chosen folder (restart tree or whole scepter_run_* job folder).
         zip_parent = os.path.dirname(target_folder_path.rstrip("/")) or "."
         zip_folder = os.path.basename(target_folder_path.rstrip("/"))
         zip_cmd = f"cd {zip_parent} && zip -r {zip_folder}.zip {zip_folder}/ 2>&1"
