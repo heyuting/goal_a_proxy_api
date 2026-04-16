@@ -95,6 +95,19 @@ def _find_baseline_batch_for_member(job_id):
     return None
 
 
+def _find_run_model_batch_for_member(job_id):
+    """Resolve batch_id from a per-location run-model job_id using the registry/cache."""
+    for bid, rec in BATCH_JOB_CACHE.items():
+        if not str(bid).startswith("scepter_batch_"):
+            continue
+        jt = rec.get("job_type")
+        if jt is not None and jt != "scepter_run":
+            continue
+        if job_id in (rec.get("job_ids") or []):
+            return bid
+    return None
+
+
 def _effective_spinup_for_restart(spinup_name, spinup_batch_id=None):
     """
     restart_add_gbas looks for spinup under SCEPTER/jobs/<spinup_name>.
@@ -159,6 +172,51 @@ def _resolve_baseline_batch_id(batch_id):
     return None, (
         f"Invalid batch id '{bid}'. Expected baseline_batch_<suffix> from the batch submit "
         "response, or a batch member job id like baseline_<ts>_<index>."
+    )
+
+
+def _resolve_run_model_batch_id(batch_id):
+    """
+    Accept several frontend forms and return the canonical key in BATCH_JOB_CACHE.
+
+    - scepter_batch_123456 (canonical)
+    - scepter_run_12345_0 (batch member job_id with batch_id in JOB_STATUS_CACHE or registry)
+    - 123456 -> scepter_batch_123456 (suffix only, if known to server)
+    """
+    if not batch_id or not str(batch_id).strip():
+        return None, "Batch id is required."
+    bid = str(batch_id).strip()
+
+    if bid in BATCH_JOB_CACHE:
+        if not bid.startswith("scepter_batch_"):
+            return None, f"Invalid batch id '{bid}'."
+        return bid, None
+
+    if bid.startswith("scepter_batch_"):
+        return bid, None
+
+    if re.match(r"^scepter_run_\d+_\d+$", bid):
+        info = JOB_STATUS_CACHE.get(bid, {})
+        nested = info.get("batch_id")
+        if nested and nested in BATCH_JOB_CACHE:
+            return nested, None
+        reg = _find_run_model_batch_for_member(bid)
+        if reg:
+            return reg, None
+        return None, (
+            f"No batch found for job {bid}. Use the batch_id from the submit response, "
+            "or ensure scepter_batch_registry.json is present if the API was restarted."
+        )
+
+    if bid.isdigit():
+        cand = f"scepter_batch_{bid}"
+        if cand in BATCH_JOB_CACHE:
+            return cand, None
+        return cand, None
+
+    return None, (
+        f"Invalid batch id '{bid}'. Expected scepter_batch_<suffix> from the batch submit "
+        "response, or a batch member job id like scepter_run_<ts>_<index>."
     )
 
 
@@ -270,17 +328,20 @@ def _run_model_filesystem_completion(ssh, job_folder, restart_name):
 
 
 def _batch_overall_from_status_counts(status_counts, n_jobs):
+    """Batch is completed only when every job is completed; mixed states stay in progress."""
     if n_jobs == 0:
         return "unknown"
-    if status_counts.get("completed", 0) == n_jobs:
-        return "completed"
     if status_counts.get("failed", 0) > 0:
         return "failed"
-    if status_counts.get("running", 0) > 0 or status_counts.get("pending", 0) > 0:
-        return "running"
+    if status_counts.get("completed", 0) == n_jobs:
+        return "completed"
     if status_counts.get("submitting", 0) > 0 or status_counts.get("submitted", 0) > 0:
         return "submitting"
-    return "unknown"
+    # If every job is still queued and none has started, keep overall as pending.
+    if status_counts.get("pending", 0) == n_jobs:
+        return "pending"
+    # running, unknown, or mixed with some completed
+    return "running"
 
 
 def _refresh_baseline_job_live(ssh, job_id, batch_folder=None):
@@ -436,20 +497,32 @@ def _refresh_run_model_job_live(ssh, job_id):
         check = f"test -d {job_folder} && echo exists || echo not_found"
         stdin, stdout, stderr = ssh.exec_command(check)
         if stdout.read().decode().strip() == "not_found":
-            if job_info.get("status") == "submitting":
+            discovered = _discover_baseline_job_folder_ssh(ssh, job_id)
+            if discovered:
+                job_folder = discovered
+                job_info["job_folder"] = job_folder
+                JOB_STATUS_CACHE[job_id] = job_info
+            elif job_info.get("status") == "submitting":
                 job_info["status"] = "submitting"
+                JOB_STATUS_CACHE[job_id] = job_info
+                return {
+                    "job_id": job_id,
+                    "status": "submitting",
+                    "bouchet_job_id": None,
+                    "error": None,
+                }
             else:
                 job_info["status"] = "unknown"
                 job_info["error"] = (
                     job_info.get("error") or "Job folder not found on Bouchet"
                 )
-            JOB_STATUS_CACHE[job_id] = job_info
-            return {
-                "job_id": job_id,
-                "status": job_info["status"],
-                "bouchet_job_id": None,
-                "error": job_info.get("error"),
-            }
+                JOB_STATUS_CACHE[job_id] = job_info
+                return {
+                    "job_id": job_id,
+                    "status": "unknown",
+                    "bouchet_job_id": None,
+                    "error": job_info.get("error"),
+                }
         read_cmd = f"cat {job_folder}/.bouchet_job_id 2>/dev/null || (grep -h 'Submitted batch job' {job_folder}/*.out 2>/dev/null | tail -1 | awk '{{print $NF}}')"
         stdin, stdout, stderr = ssh.exec_command(read_cmd)
         recovered = stdout.read().decode().strip()
@@ -520,10 +593,43 @@ def _baseline_jobs_root():
 
 
 def _resolve_run_model_job_folder(job_id, job_info):
-    """Canonical jobs/.../scepter_run_* path (matches submit_run_scepter_model)."""
-    if job_info.get("job_folder"):
-        return job_info["job_folder"]
+    """jobs/scepter_run_* (single submit) or jobs/scepter_batch_*/scepter_run_* (batch)."""
+    jf = job_info.get("job_folder")
+    if jf:
+        return jf
+    bid = job_info.get("batch_id")
+    if bid:
+        batch_folder = BATCH_JOB_CACHE.get(bid, {}).get("batch_folder")
+        if batch_folder:
+            return f"{batch_folder.rstrip('/')}/{job_id}"
     return f"{_baseline_jobs_root()}/{job_id}"
+
+
+def _hydrate_run_model_job_from_registry(job_id):
+    """After API restart, fill job_folder/batch_id from BATCH_JOB_CACHE for batch run-model jobs."""
+    if not job_id.startswith("scepter_run_"):
+        return
+    if JOB_STATUS_CACHE.get(job_id, {}).get("job_folder"):
+        return
+    for bid, rec in BATCH_JOB_CACHE.items():
+        if not str(bid).startswith("scepter_batch_"):
+            continue
+        jt = rec.get("job_type")
+        if jt is not None and jt != "scepter_run":
+            continue
+        if job_id not in (rec.get("job_ids") or []):
+            continue
+        bf = rec.get("batch_folder")
+        job_folder = (
+            f"{bf.rstrip('/')}/{job_id}" if bf else f"{_baseline_jobs_root()}/{job_id}"
+        )
+        merged = dict(JOB_STATUS_CACHE.get(job_id, {}))
+        merged.setdefault("job_id", job_id)
+        merged["job_folder"] = job_folder
+        merged["batch_id"] = bid
+        merged.setdefault("job_type", "scepter_run")
+        JOB_STATUS_CACHE[job_id] = merged
+        return
 
 
 def _resolve_baseline_job_folder_from_cache(job_id, job_info):
@@ -1850,6 +1956,8 @@ def submit_run_scepter_model_batch():
 
         timestamp = int(time.time())
         batch_id = f"scepter_batch_{str(timestamp)[-6:]}"
+        jobs_base = _baseline_jobs_root()
+        batch_folder = f"{jobs_base}/{batch_id}"
         scepter_path = f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/SCEPTER"
         restart_script = os.getenv(
             "RESTART_ADD_GBAS_SCRIPT", f"{scepter_path}/restart_add_gbas.py"
@@ -1944,9 +2052,7 @@ def submit_run_scepter_model_batch():
             )
 
             job_id = f"scepter_run_{str(timestamp)[-5:]}_{i}"
-            job_folder = (
-                f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/SCEPTER/jobs/{job_id}"
-            )
+            job_folder = f"{batch_folder}/{job_id}"
 
             params_extras = {
                 "particle_size": particle_size,
@@ -1985,6 +2091,7 @@ def submit_run_scepter_model_batch():
                 "bouchet_job_id": None,
                 "job_folder": job_folder,
                 "job_type": "scepter_run",
+                "batch_id": batch_id,
                 "parameters": {
                     "spinup_name": spinup_name,
                     "spinup_for_restart": spinup_for_restart,
@@ -2000,6 +2107,7 @@ def submit_run_scepter_model_batch():
             "job_ids": job_ids,
             "submitted_at": time.time(),
             "job_type": "scepter_run",
+            "batch_folder": batch_folder,
         }
         _persist_scepter_batch_record(batch_id, BATCH_JOB_CACHE[batch_id])
 
@@ -2010,6 +2118,17 @@ def submit_run_scepter_model_batch():
                 ssh = None
                 try:
                     ssh = get_ssh_connection()
+                    manifest_data = {
+                        "batch_id": batch_id,
+                        "job_ids": job_ids,
+                        "job_type": "scepter_run",
+                        "submitted_at": time.time(),
+                    }
+                    manifest_json = json.dumps(manifest_data, indent=2)
+                    ssh.exec_command(f"mkdir -p {batch_folder}")
+                    ssh.exec_command(
+                        f"cat > {batch_folder}/manifest.json << 'MANIFEST_EOF'\n{manifest_json}\nMANIFEST_EOF"
+                    )
                     for cfg in job_configs:
                         try:
                             current_app.logger.info(
@@ -2165,6 +2284,7 @@ exit $EXIT
         return jsonify(
             {
                 "batch_id": batch_id,
+                "batch_folder": batch_folder,
                 "job_ids": job_ids,
                 "status": "submitting",
                 "message": f"Submitting {len(job_ids)} SCEPTER model run(s). Each location is a separate SLURM job.",
@@ -2200,17 +2320,17 @@ def check_run_scepter_model_batch_status(batch_id):
         return response, 200
 
     try:
-        batch_info = BATCH_JOB_CACHE.get(batch_id, {})
+        resolved, err = _resolve_run_model_batch_id(batch_id)
+        if err and not resolved:
+            return jsonify({"error": err, "batch_id": batch_id}), 400
+        if not resolved.startswith("scepter_batch_"):
+            return jsonify({"error": "Invalid batch_id", "batch_id": batch_id}), 400
+
+        batch_info = BATCH_JOB_CACHE.get(resolved, {})
         job_ids = batch_info.get("job_ids", [])
 
-        if not batch_id.startswith("scepter_batch_"):
-            return (
-                jsonify({"error": "Invalid batch_id", "batch_id": batch_id}),
-                400,
-            )
-
         if not job_ids:
-            return jsonify({"error": "Batch not found", "batch_id": batch_id}), 404
+            return jsonify({"error": "Batch not found", "batch_id": resolved}), 404
 
         try:
             ssh = get_ssh_connection_pooled()
@@ -2238,6 +2358,7 @@ def check_run_scepter_model_batch_status(batch_id):
                     "status": row["status"],
                     "bouchet_job_id": row.get("bouchet_job_id"),
                     "error": row.get("error"),
+                    "download_ready": st == "completed",
                 }
             )
 
@@ -2245,7 +2366,7 @@ def check_run_scepter_model_batch_status(batch_id):
 
         return jsonify(
             {
-                "batch_id": batch_id,
+                "batch_id": resolved,
                 "overall": overall,
                 "jobs": jobs_status,
                 "status_counts": status_counts,
@@ -2258,6 +2379,140 @@ def check_run_scepter_model_batch_status(batch_id):
             f"Error in check_run_scepter_model_batch_status for {batch_id}: {str(e)}"
         )
         return jsonify({"batch_id": batch_id, "error": str(e)}), 500
+
+
+@scepter_bp.route(
+    "/api/run-scepter-model-batch/<batch_id>/download", methods=["GET", "OPTIONS"]
+)
+@scepter_bp.route(
+    "/api/scepter/run-model-batch/<batch_id>/download", methods=["GET", "OPTIONS"]
+)
+def download_run_scepter_model_batch_results(batch_id):
+    """Download the whole run-model batch directory on Bouchet as one zip (manifest + all locations)."""
+    if request.method == "OPTIONS":
+        response = make_response()
+        response.headers.add("Access-Control-Allow-Origin", "*")
+        response.headers.add(
+            "Access-Control-Allow-Headers",
+            "Content-Type, ngrok-skip-browser-warning, Authorization, X-Requested-With",
+        )
+        response.headers.add("Access-Control-Allow-Methods", "GET, OPTIONS")
+        response.headers.add("Access-Control-Max-Age", "3600")
+        return response, 200
+
+    try:
+        resolved, err = _resolve_run_model_batch_id(batch_id)
+        if err and not resolved:
+            return jsonify({"error": err, "batch_id": batch_id}), 400
+        if not resolved.startswith("scepter_batch_"):
+            return jsonify({"error": "Invalid batch_id", "batch_id": batch_id}), 400
+
+        batch_info = BATCH_JOB_CACHE.get(resolved, {})
+        batch_folder = batch_info.get("batch_folder") or (
+            f"{_baseline_jobs_root()}/{resolved}"
+        )
+
+        try:
+            ssh = get_ssh_connection_pooled()
+        except Exception as ssh_error:
+            error_msg = str(ssh_error)
+            current_app.logger.error(
+                f"SSH connection failed for run-model batch download {batch_id}: {error_msg}"
+            )
+            if "Authentication failed" in error_msg or "Anomalous request" in error_msg:
+                return (
+                    jsonify(
+                        {
+                            "error": "Authentication failed. Please wait a minute and try again. Too many connection attempts may trigger security measures.",
+                            "batch_id": batch_id,
+                        }
+                    ),
+                    429,
+                )
+            return (
+                jsonify(
+                    {
+                        "error": f"Failed to connect to Bouchet HPC: {error_msg}",
+                        "batch_id": batch_id,
+                    }
+                ),
+                500,
+            )
+
+        chk = f"test -d {shlex.quote(batch_folder)} && echo ok || echo missing"
+        stdin, stdout, stderr = ssh.exec_command(chk)
+        if stdout.read().decode().strip() != "ok":
+            return (
+                jsonify(
+                    {
+                        "error": "Batch folder not found on Bouchet",
+                        "batch_id": resolved,
+                        "batch_folder": batch_folder,
+                    }
+                ),
+                404,
+            )
+
+        parent_dir = os.path.dirname(batch_folder.rstrip("/")) or "."
+        folder_name = os.path.basename(batch_folder.rstrip("/"))
+        zip_cmd = (
+            f"cd {shlex.quote(parent_dir)} && zip -r {shlex.quote(folder_name)}.zip "
+            f"{shlex.quote(folder_name)}/ 2>&1"
+        )
+        stdin, stdout, stderr = ssh.exec_command(zip_cmd, timeout=300)
+        exit_status = stdout.channel.recv_exit_status()
+        zip_output = stdout.read().decode()
+        error_msg = stderr.read().decode()
+
+        if exit_status != 0:
+            current_app.logger.error(
+                f"Failed to create run-model batch zip for {batch_id}: {error_msg or zip_output}"
+            )
+            return (
+                jsonify(
+                    {
+                        "error": f"Failed to create zip on Bouchet: {error_msg or zip_output}",
+                        "batch_id": batch_id,
+                    }
+                ),
+                500,
+            )
+
+        sftp = ssh.open_sftp()
+        zip_path = f"{parent_dir}/{folder_name}.zip"
+        remote_file = sftp.open(zip_path, "rb")
+        zip_data = remote_file.read()
+        remote_file.close()
+        sftp.close()
+
+        response = make_response(zip_data)
+        response.headers["Content-Type"] = "application/zip"
+        response.headers["Content-Disposition"] = (
+            f"attachment; filename={folder_name}.zip"
+        )
+        return response
+
+    except Exception as e:
+        error_msg = str(e)
+        current_app.logger.error(
+            f"Error in download_run_scepter_model_batch_results for {batch_id}: {error_msg}"
+        )
+        if "Authentication failed" in error_msg or "Anomalous request" in error_msg:
+            return (
+                jsonify(
+                    {
+                        "error": "Authentication failed. Please wait a minute and try again. Too many connection attempts may trigger security measures.",
+                        "batch_id": batch_id,
+                    }
+                ),
+                429,
+            )
+        return (
+            jsonify(
+                {"error": f"Failed to download run-model batch results: {error_msg}"}
+            ),
+            500,
+        )
 
 
 @scepter_bp.route("/api/run-scepter-model/<job_id>/status", methods=["GET", "OPTIONS"])
@@ -2376,20 +2631,14 @@ def download_run_scepter_model_results(job_id):
         return response, 200
 
     try:
-        job_info = JOB_STATUS_CACHE.get(job_id, {})
-        job_folder = job_info.get(
-            "job_folder",
-            f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/SCEPTER/jobs/{job_id}",
-        )
+        _hydrate_run_model_job_from_registry(job_id)
+        job_info = dict(JOB_STATUS_CACHE.get(job_id, {}))
+        job_folder = _resolve_run_model_job_folder(job_id, job_info)
+        job_info["job_folder"] = job_folder
+        JOB_STATUS_CACHE[job_id] = job_info
         params = job_info.get("parameters", {})
         restart_name = params.get("restart_name")
-
-        # Zip restart outputs: prefer .../scepter_run_*/<restart_name>/ (after post-job mv),
-        # else legacy .../jobs/<restart_name>/ beside the run folder.
-        jobs_base = os.path.dirname(job_folder.rstrip("/")) or "."
         rn = restart_name.strip() if isinstance(restart_name, str) else ""
-        in_job = os.path.join(job_folder, rn) if rn else None
-        sibling = os.path.join(jobs_base, rn) if rn else None
 
         try:
             ssh = get_ssh_connection()
@@ -2417,6 +2666,26 @@ def download_run_scepter_model_results(job_id):
                 ),
                 500,
             )
+
+        if not rn:
+            stdin, stdout, stderr = ssh.exec_command(
+                f"cat {shlex.quote(job_folder.rstrip('/'))}/parameters.json 2>/dev/null"
+            )
+            raw = stdout.read().decode()
+            if raw.strip():
+                try:
+                    pj = json.loads(raw)
+                    r2 = pj.get("restart_name")
+                    if isinstance(r2, str) and r2.strip():
+                        rn = r2.strip()
+                except (json.JSONDecodeError, TypeError):
+                    pass
+
+        # Zip restart outputs: prefer .../scepter_run_*/<restart_name>/ (after post-job mv),
+        # else legacy .../jobs/<restart_name>/ beside the run folder.
+        jobs_base = os.path.dirname(job_folder.rstrip("/")) or "."
+        in_job = os.path.join(job_folder, rn) if rn else None
+        sibling = os.path.join(jobs_base, rn) if rn else None
 
         if in_job is not None and sibling is not None:
             pick_cmd = (

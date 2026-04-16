@@ -566,6 +566,8 @@ Run-model batches are recorded in the same **`scepter_batch_registry.json`** / *
 
 Submits SCEPTER run-model jobs for multiple locations. Each location is submitted as a **separate SLURM job** on the HPC.
 
+On Bouchet, all runs in the batch share one directory: **`SCEPTER/jobs/<batch_id>/`** (e.g. `scepter_batch_123456/`), with each location under **`.../<batch_id>/<job_id>/`** (mirroring baseline batch layout). A **`manifest.json`** is written in the batch folder. Single-location **`POST /api/run-scepter-model`** still uses **`jobs/<scepter_run_*>`** at the top level of `jobs/`.
+
 **Request Body:**
 
 Per-location objects support the same **`spinup_batch_id`** / **`baseline_batch_id`** (and camelCase) fields as **`POST /api/run-scepter-model`**. You can also set **`spinup_name`** to a path containing **`/`** (e.g. `baseline_batch_895903/baseline_95903_0`).
@@ -596,6 +598,7 @@ Per-location objects support the same **`spinup_batch_id`** / **`baseline_batch_
 ```json
 {
   "batch_id": "scepter_batch_123456",
+  "batch_folder": "/home/<user>/project_pi_par35/yhs5/SCEPTER/jobs/scepter_batch_123456",
   "job_ids": ["scepter_run_12345_0", "scepter_run_12345_1"],
   "status": "submitting",
   "message": "Submitting 2 SCEPTER model run(s). Each location is a separate SLURM job.",
@@ -609,7 +612,7 @@ Per-location objects support the same **`spinup_batch_id`** / **`baseline_batch_
 
 #### GET `/api/run-scepter-model-batch/{batchId}/status`
 
-Checks the status of all jobs in a batch.
+Checks the status of all jobs in a batch. **`batchId`** can be the canonical `scepter_batch_<suffix>`, a batch member **`scepter_run_<ts>_<index>`**, or a numeric suffix if that batch is in the server registry.
 
 On every request, each job’s state is **recomputed on Bouchet** (same rules as `GET /api/run-scepter-model/{jobId}/status`), the cache is updated, and **`overall`**, **`jobs[].status`**, and **`status_counts`** reflect those values. If SSH fails, the endpoint returns **500**.
 
@@ -623,12 +626,14 @@ On every request, each job’s state is **recomputed on Bouchet** (same rules as
     {
       "job_id": "scepter_run_12345_0",
       "status": "completed",
-      "bouchet_job_id": "67890"
+      "bouchet_job_id": "67890",
+      "download_ready": true
     },
     {
       "job_id": "scepter_run_12345_1",
       "status": "running",
-      "bouchet_job_id": "67891"
+      "bouchet_job_id": "67891",
+      "download_ready": false
     }
   ],
   "status_counts": {
@@ -648,10 +653,22 @@ On every request, each job’s state is **recomputed on Bouchet** (same rules as
 
 ---
 
+#### GET `/api/run-scepter-model-batch/{batchId}/download`
+
+Downloads the **entire** batch directory on Bouchet as a single zip (`manifest.json` and all per-location job folders under `SCEPTER/jobs/<batch_id>/`). Works even when some jobs are still running (the zip reflects whatever is on disk at request time).
+
+Same **`batchId`** forms as status when resolving from the registry: canonical `scepter_batch_<suffix>`, a batch member `scepter_run_<ts>_<index>`, or a numeric suffix if that batch is known to the server.
+
+**Aliases:** `GET /api/scepter/run-model-batch/{batchId}/download`
+
+**Location:** `blueprints/scepter.py`
+
+---
+
 Individual job status and download use the existing single-job endpoints:
 
 - `GET /api/run-scepter-model/{jobId}/status` – per-location status
-- `GET /api/run-scepter-model/{jobId}/download` – per-location download
+- `GET /api/run-scepter-model/{jobId}/download` – per-location download (zips one location’s outputs, typically the restart tree for that run)
 
 ---
 
