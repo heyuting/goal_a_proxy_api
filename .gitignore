@@ -112,8 +112,9 @@ dmypy.json
 *.swp
 *.swo
 
-# SCEPTER script maintained outside this repo (deploy on Bouchet separately)
+# SCEPTER scripts maintained outside this repo (deploy on Bouchet separately)
 restart_add_gbas.py
+scripts/
 
 # OS
 .DS_Store

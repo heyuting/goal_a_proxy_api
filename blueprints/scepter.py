@@ -718,12 +718,10 @@ def submit_baseline_simulation():
             f"{scepter_path}/create_spinup_slurm_jobs.py",
         )
 
-        output_dir = f"{job_folder}/output"
         JOB_STATUS_CACHE[job_id] = {
             "job_id": job_id,
             "bouchet_job_id": None,
             "job_folder": job_folder,
-            "output_dir": output_dir,
             "job_type": "baseline",
             "parameters": {
                 "coordinate": [lat, lon],
@@ -743,18 +741,15 @@ def submit_baseline_simulation():
                     )
                     ssh = get_ssh_connection_pooled()
 
-                    output_dir = f"{job_folder}/output"
                     params_data = {
                         "coordinate": [lat, lon],
                         "location_name": location_name,
                         "job_folder": job_folder,
-                        "output_dir": output_dir,
                         "job_id": job_id,
                     }
                     params_json = json.dumps(params_data, indent=2)
                     commands = [
                         f"mkdir -p {job_folder}",
-                        f"mkdir -p {output_dir}",
                         f"cat > {job_folder}/parameters.json << 'PARAMS_EOF'\n{params_json}\nPARAMS_EOF",
                         f"echo '{lat} {lon}' > {job_folder}/coords.txt",
                     ]
@@ -956,13 +951,11 @@ def submit_baseline_simulation_batch():
 
             job_id = f"baseline_{str(timestamp)[-5:]}_{i}"
             job_folder = f"{batch_folder}/{job_id}"
-            output_dir = f"{job_folder}/output"
 
             JOB_STATUS_CACHE[job_id] = {
                 "job_id": job_id,
                 "bouchet_job_id": None,
                 "job_folder": job_folder,
-                "output_dir": output_dir,
                 "job_type": "baseline",
                 "parameters": {
                     "coordinate": [lat, lon],
@@ -978,7 +971,6 @@ def submit_baseline_simulation_batch():
                 {
                     "job_id": job_id,
                     "job_folder": job_folder,
-                    "output_dir": output_dir,
                     "lat": lat,
                     "lon": lon,
                     "location_name": location_name,
@@ -1024,13 +1016,11 @@ def submit_baseline_simulation_batch():
                                 "coordinate": [cfg["lat"], cfg["lon"]],
                                 "location_name": cfg["location_name"],
                                 "job_folder": cfg["job_folder"],
-                                "output_dir": cfg["output_dir"],
                                 "job_id": cfg["job_id"],
                             }
                             params_json = json.dumps(params_data, indent=2)
                             commands = [
                                 f"mkdir -p {cfg['job_folder']}",
-                                f"mkdir -p {cfg['output_dir']}",
                                 f"cat > {cfg['job_folder']}/parameters.json << 'PARAMS_EOF'\n{params_json}\nPARAMS_EOF",
                                 f"echo '{cfg['lat']} {cfg['lon']}' > {cfg['job_folder']}/coords.txt",
                             ]
