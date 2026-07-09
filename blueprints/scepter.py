@@ -271,6 +271,202 @@ def _slurm_raw_to_status(slurm_status):
     return st
 
 
+# Comparable AWS instance for SCEPTER SLURM jobs (4 CPUs, 16 GB — see #SBATCH in job scripts).
+SCEPTER_SLURM_CPUS_PER_TASK = int(os.getenv("SCEPTER_SLURM_CPUS_PER_TASK", "4"))
+SCEPTER_SLURM_MEM_GB = int(os.getenv("SCEPTER_SLURM_MEM_GB", "16"))
+SCEPTER_AWS_INSTANCE_TYPE = os.getenv("SCEPTER_AWS_INSTANCE_TYPE", "m6i.xlarge")
+SCEPTER_AWS_REGION = os.getenv("SCEPTER_AWS_REGION", "us-east-1")
+SCEPTER_AWS_ON_DEMAND_USD_PER_HR = float(
+    os.getenv("SCEPTER_AWS_ON_DEMAND_USD_PER_HR", "0.192")
+)
+
+
+def _parse_slurm_elapsed_to_seconds(elapsed):
+    """Parse sacct Elapsed / TotalCPU: DD-HH:MM:SS, HH:MM:SS, MM:SS, or raw seconds."""
+    if elapsed is None:
+        return None
+    s = str(elapsed).strip()
+    if not s or s.upper() in ("UNKNOWN", "NONE", "N/A"):
+        return None
+    try:
+        days = 0
+        if "-" in s:
+            day_part, s = s.split("-", 1)
+            days = int(day_part)
+        parts = s.split(":")
+        if len(parts) == 3:
+            hours, minutes, seconds = int(parts[0]), int(parts[1]), int(float(parts[2]))
+        elif len(parts) == 2:
+            hours, minutes, seconds = 0, int(parts[0]), int(float(parts[1]))
+        elif len(parts) == 1:
+            return int(float(parts[0]))
+        else:
+            return None
+        return days * 86400 + hours * 3600 + minutes * 60 + seconds
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_slurm_max_rss_mb(max_rss):
+    if max_rss is None:
+        return None
+    s = str(max_rss).strip().upper()
+    if not s or s in ("N/A", "NONE"):
+        return None
+    suffix = s[-1]
+    multipliers = {"K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}
+    if suffix in multipliers:
+        try:
+            return round(float(s[:-1]) * multipliers[suffix], 1)
+        except ValueError:
+            return None
+    try:
+        return round(float(s) / 1024, 1)
+    except ValueError:
+        return None
+
+
+def _format_duration_seconds(seconds):
+    if seconds is None:
+        return None
+    total = int(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _slurm_sacct_usage(ssh, bouchet_job_id):
+    """Fetch Elapsed, AllocCPUS, MaxRSS, TotalCPU for the allocation row (-X)."""
+    if not bouchet_job_id:
+        return {}
+    cmd = (
+        f"sacct -j {bouchet_job_id} -n -X -P "
+        f"-o Elapsed,AllocCPUS,MaxRSS,TotalCPU 2>/dev/null | head -1"
+    )
+    stdin, stdout, stderr = ssh.exec_command(cmd)
+    line = (stdout.read().decode() or "").strip()
+    if not line:
+        return {}
+    parts = line.split("|")
+    while len(parts) < 4:
+        parts.append("")
+    elapsed_raw, alloc_cpus_raw, max_rss_raw, total_cpu_raw = parts[:4]
+    alloc_cpus = None
+    try:
+        if str(alloc_cpus_raw).strip().isdigit():
+            alloc_cpus = int(str(alloc_cpus_raw).strip())
+    except ValueError:
+        pass
+    return {
+        "elapsed_seconds": _parse_slurm_elapsed_to_seconds(elapsed_raw),
+        "elapsed": str(elapsed_raw).strip() or None,
+        "alloc_cpus": alloc_cpus,
+        "max_rss_mb": _parse_slurm_max_rss_mb(max_rss_raw),
+        "max_rss": str(max_rss_raw).strip() or None,
+        "total_cpu_seconds": _parse_slurm_elapsed_to_seconds(total_cpu_raw),
+        "total_cpu": str(total_cpu_raw).strip() or None,
+    }
+
+
+def _build_job_usage_payload(ssh, bouchet_job_id, submitted_at=None):
+    """Resources used (from sacct) and AWS on-demand cost estimate for one job."""
+    usage = _slurm_sacct_usage(ssh, bouchet_job_id) if bouchet_job_id else {}
+    elapsed_seconds = usage.get("elapsed_seconds")
+    elapsed_is_estimate = False
+    if elapsed_seconds is None and submitted_at:
+        try:
+            elapsed_seconds = max(0, int(time.time() - float(submitted_at)))
+            elapsed_is_estimate = True
+        except (TypeError, ValueError):
+            elapsed_seconds = None
+
+    aws_hours = (elapsed_seconds / 3600.0) if elapsed_seconds is not None else None
+    aws_cost = (
+        round(aws_hours * SCEPTER_AWS_ON_DEMAND_USD_PER_HR, 4)
+        if aws_hours is not None
+        else None
+    )
+
+    return {
+        "resources": {
+            "requested_cpus": SCEPTER_SLURM_CPUS_PER_TASK,
+            "requested_memory_gb": SCEPTER_SLURM_MEM_GB,
+            "alloc_cpus": usage.get("alloc_cpus") or SCEPTER_SLURM_CPUS_PER_TASK,
+            "max_rss_mb": usage.get("max_rss_mb"),
+            "elapsed_seconds": elapsed_seconds,
+            "elapsed": usage.get("elapsed")
+            or (_format_duration_seconds(elapsed_seconds) if elapsed_seconds is not None else None),
+            "total_cpu_seconds": usage.get("total_cpu_seconds"),
+            "total_cpu": usage.get("total_cpu"),
+            "elapsed_is_estimate": elapsed_is_estimate,
+        },
+        "aws_cost_estimate": {
+            "instance_type": SCEPTER_AWS_INSTANCE_TYPE,
+            "pricing_model": "on_demand",
+            "region": SCEPTER_AWS_REGION,
+            "usd_per_hour": SCEPTER_AWS_ON_DEMAND_USD_PER_HR,
+            "billable_hours": round(aws_hours, 4) if aws_hours is not None else None,
+            "usd": aws_cost,
+            "note": (
+                "Estimate using AWS m6i.xlarge on-demand wall-clock time "
+                "(4 vCPU, 16 GiB). Excludes storage and data transfer."
+            ),
+        },
+    }
+
+
+def _aggregate_batch_usage(jobs_with_usage):
+    """Sum elapsed time and AWS estimates across batch member jobs."""
+    total_elapsed = 0
+    total_usd = 0.0
+    max_rss = 0.0
+    count = 0
+    for job in jobs_with_usage or []:
+        resources = job.get("resources") or {}
+        cost = job.get("aws_cost_estimate") or {}
+        elapsed = resources.get("elapsed_seconds")
+        if elapsed is not None:
+            total_elapsed += int(elapsed)
+            count += 1
+        usd = cost.get("usd")
+        if usd is not None:
+            total_usd += float(usd)
+        rss = resources.get("max_rss_mb")
+        if rss is not None:
+            max_rss = max(max_rss, float(rss))
+
+    if count == 0 and total_usd == 0:
+        return None
+
+    return {
+        "job_count": len(jobs_with_usage or []),
+        "total_elapsed_seconds": total_elapsed or None,
+        "total_elapsed": _format_duration_seconds(total_elapsed) if total_elapsed else None,
+        "max_rss_mb": round(max_rss, 1) if max_rss else None,
+        "total_aws_usd": round(total_usd, 4) if total_usd else None,
+        "aws_cost_estimate": {
+            "instance_type": SCEPTER_AWS_INSTANCE_TYPE,
+            "pricing_model": "on_demand",
+            "region": SCEPTER_AWS_REGION,
+            "usd_per_hour": SCEPTER_AWS_ON_DEMAND_USD_PER_HR,
+            "usd": round(total_usd, 4) if total_usd else None,
+            "note": "Sum of per-location on-demand estimates (parallel jobs on AWS would bill concurrently).",
+        },
+    }
+
+
+def _enrich_status_row_with_usage(ssh, row, submitted_at=None):
+    """Attach resources + aws_cost_estimate to a status row dict."""
+    bouchet_job_id = row.get("bouchet_job_id")
+    usage_payload = _build_job_usage_payload(ssh, bouchet_job_id, submitted_at)
+    row.update(usage_payload)
+    return row
+
+
 def _slurm_sacct_resolve_state(ssh, bouchet_job_id):
     """Best State from sacct: prefer terminal (completed/failed) on any line.
 
@@ -360,12 +556,13 @@ def _refresh_baseline_job_live(ssh, job_id, batch_folder=None):
 
     if job_info.get("status") == "failed" and job_info.get("error"):
         JOB_STATUS_CACHE[job_id] = job_info
-        return {
+        row = {
             "job_id": job_id,
             "status": "failed",
             "bouchet_job_id": job_info.get("bouchet_job_id"),
             "error": job_info.get("error"),
         }
+        return _enrich_status_row_with_usage(ssh, row, job_info.get("submitted_at"))
 
     if batch_folder:
         job_folder = f"{batch_folder.rstrip('/')}/{job_id}"
@@ -445,9 +642,7 @@ def _refresh_baseline_job_live(ssh, job_id, batch_folder=None):
         if slurm_status:
             status = _slurm_raw_to_status(slurm_status)
         else:
-            check_done = (
-                f"test -f {job_folder}/.completed && echo completed || echo not_completed"
-            )
+            check_done = f"test -f {job_folder}/.completed && echo completed || echo not_completed"
             stdin, stdout, stderr = ssh.exec_command(check_done)
             done = stdout.read().decode().strip() == "completed"
             status = "completed" if done else ("unknown" if not sacct_st else acct_m)
@@ -461,12 +656,13 @@ def _refresh_baseline_job_live(ssh, job_id, batch_folder=None):
 
     job_info["status"] = status
     JOB_STATUS_CACHE[job_id] = job_info
-    return {
+    row = {
         "job_id": job_id,
         "status": status,
         "bouchet_job_id": bouchet_job_id,
         "error": job_info.get("error"),
     }
+    return _enrich_status_row_with_usage(ssh, row, job_info.get("submitted_at"))
 
 
 def _refresh_run_model_job_live(ssh, job_id):
@@ -482,12 +678,13 @@ def _refresh_run_model_job_live(ssh, job_id):
 
     if job_info.get("status") == "failed" and job_info.get("error"):
         JOB_STATUS_CACHE[job_id] = job_info
-        return {
+        row = {
             "job_id": job_id,
             "status": "failed",
             "bouchet_job_id": job_info.get("bouchet_job_id"),
             "error": job_info.get("error"),
         }
+        return _enrich_status_row_with_usage(ssh, row, job_info.get("submitted_at"))
 
     job_folder = _resolve_run_model_job_folder(job_id, job_info)
     job_info["job_folder"] = job_folder
@@ -565,9 +762,7 @@ def _refresh_run_model_job_live(ssh, job_id):
         if slurm_status:
             status = _slurm_raw_to_status(slurm_status)
         else:
-            check_done = (
-                f"test -f {job_folder}/.completed && echo completed || echo not_completed"
-            )
+            check_done = f"test -f {job_folder}/.completed && echo completed || echo not_completed"
             stdin, stdout, stderr = ssh.exec_command(check_done)
             done = stdout.read().decode().strip() == "completed"
             status = "completed" if done else ("unknown" if not sacct_st else acct_m)
@@ -580,12 +775,13 @@ def _refresh_run_model_job_live(ssh, job_id):
 
     job_info["status"] = status
     JOB_STATUS_CACHE[job_id] = job_info
-    return {
+    row = {
         "job_id": job_id,
         "status": status,
         "bouchet_job_id": bouchet_job_id,
         "error": job_info.get("error"),
     }
+    return _enrich_status_row_with_usage(ssh, row, job_info.get("submitted_at"))
 
 
 def _baseline_jobs_root():
@@ -775,25 +971,34 @@ set -x
 
 cd {scepter_path}
 
-# Use a venv with numpy/deps if present (spinup.py needs numpy, make_inputs, etc.)
-for venv_path in ".venv" "venv" "../venv"; do
-    if [ -f "$venv_path/bin/activate" ]; then
-        if "$venv_path/bin/python" -c "import numpy" 2>/dev/null; then
-            echo "Activating venv at $venv_path (numpy OK)"
-            set +u
-            source "$venv_path/bin/activate"
-            set -u
-            break
-        fi
-    fi
-done
-
 # So Python can find the spinup module (e.g. spinup.py or spinup/ inside SCEPTER)
 export PYTHONPATH="{scepter_path}:{job_folder}:${{PYTHONPATH:-}}"
 export SCEPTER_ROOT="{scepter_path}"
 
 # Step 1: create_spinup_slurm_jobs.py writes parameters and creates the main spinup script (e.g. spinup_name.sh)
-python3 {create_spinup_script} {job_folder}
+module purge
+module load GCC/12.2.0
+module load OpenBLAS/0.3.21-GCC-12.2.0
+module load Python/3.10.8-GCCcore-12.2.0
+
+PYTHON_CMD=""
+
+for venv_path in ".venv" "venv" "../venv"; do
+    if [ -f "$venv_path/bin/python" ]; then
+        if "$venv_path/bin/python" -c "import numpy, pandas, scipy"; then
+            PYTHON_CMD="$venv_path/bin/python"
+            echo "Using Python at $PYTHON_CMD"
+            break
+        fi
+    fi
+done
+
+if [ -z "$PYTHON_CMD" ]; then
+    echo "ERROR: No Python found with numpy, pandas, scipy"
+    exit 1
+fi
+
+"$PYTHON_CMD" {create_spinup_script} {job_folder}
 EXIT=$?
 if [ $EXIT -ne 0 ]; then
     echo "ERROR: create_spinup_slurm_jobs.py failed with exit $EXIT"
@@ -1050,28 +1255,37 @@ set -x
 
 cd {scepter_path}
 
+export PYTHONPATH="{scepter_path}:{cfg["job_folder"]}:${{PYTHONPATH:-}}"
+export SCEPTER_ROOT="{scepter_path}"
+
+module purge
+module load GCC/12.2.0
+module load OpenBLAS/0.3.21-GCC-12.2.0
+module load Python/3.10.8-GCCcore-12.2.0
+
+PYTHON_CMD=""
+
 for venv_path in ".venv" "venv" "../venv"; do
-    if [ -f "$venv_path/bin/activate" ]; then
-        if "$venv_path/bin/python" -c "import numpy" 2>/dev/null; then
-            echo "Activating venv at $venv_path (numpy OK)"
-            set +u
-            source "$venv_path/bin/activate"
-            set -u
+    if [ -f "$venv_path/bin/python" ]; then
+        if "$venv_path/bin/python" -c "import numpy, pandas, scipy"; then
+            PYTHON_CMD="$venv_path/bin/python"
+            echo "Using Python at $PYTHON_CMD"
             break
         fi
     fi
 done
 
-export PYTHONPATH="{scepter_path}:{cfg["job_folder"]}:${{PYTHONPATH:-}}"
-export SCEPTER_ROOT="{scepter_path}"
+if [ -z "$PYTHON_CMD" ]; then
+    echo "ERROR: No Python found with numpy, pandas, scipy"
+    exit 1
+fi
 
-python3 {create_spinup_script} {cfg["job_folder"]}
+"$PYTHON_CMD" {create_spinup_script} {cfg["job_folder"]}
 EXIT=$?
 if [ $EXIT -ne 0 ]; then
     echo "ERROR: create_spinup_slurm_jobs.py failed with exit $EXIT"
     exit $EXIT
 fi
-
 for f in {cfg["job_folder"]}/*.sh; do
     [ -f "$f" ] || continue
     base="$(basename "$f")"
@@ -1387,15 +1601,6 @@ def check_baseline_simulation_status(job_id):
         if not job_id.startswith("baseline_"):
             return jsonify({"error": "Invalid baseline job_id", "job_id": job_id}), 400
 
-        if job_info.get("status") == "failed":
-            return jsonify(
-                {
-                    "job_id": job_id,
-                    "status": "failed",
-                    "error": job_info.get("error", "Job failed"),
-                }
-            )
-
         job_folder = _resolve_baseline_job_folder_from_cache(job_id, job_info)
         job_info["job_folder"] = job_folder
         JOB_STATUS_CACHE[job_id] = job_info
@@ -1445,6 +1650,9 @@ def check_baseline_simulation_status(job_id):
                 "status": status,
                 "submitted_at": job_info.get("submitted_at"),
                 "logs": logs,
+                "resources": row.get("resources"),
+                "aws_cost_estimate": row.get("aws_cost_estimate"),
+                "error": row.get("error"),
             }
         )
 
@@ -1697,6 +1905,12 @@ def submit_run_scepter_model():
         else:
             params_extras["target_pH"] = "(not set)"
 
+        p80str = str(particle_size)
+        if p80str.isdigit():
+            p80str = f"{p80str}um"
+        has_target_pH = target_pH is not None and str(target_pH).strip() != ""
+        target_pH_arg = str(target_pH).strip() if has_target_pH else ""
+
         timestamp = int(time.time())
         job_id = f"scepter_run_{str(timestamp)[-5:]}"
         scepter_path = f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/SCEPTER"
@@ -1770,27 +1984,38 @@ def submit_run_scepter_model():
 set -x
 cd {scepter_path}
 
+module purge
+module load GCC/12.2.0
+module load OpenBLAS/0.3.21-GCC-12.2.0
+module load Python/3.10.8-GCCcore-12.2.0
+
 export SCEPTER_JOBS_DIR={shlex.quote(scepter_jobs_dir)}
 export SCEPTER_RESTART_DIR={shlex.quote(restart_dir_full)}
 
-# Use a venv with numpy if present (restart_add_gbas.py needs numpy)
+PYTHON_CMD=""
+
 for venv_path in ".venv" "venv" "../venv"; do
-    if [ -f "$venv_path/bin/activate" ]; then
-        if "$venv_path/bin/python" -c "import numpy" 2>/dev/null; then
-            echo "Activating venv at $venv_path (numpy OK)"
-            set +u
-            source "$venv_path/bin/activate"
-            set -u
+    if [ -f "$venv_path/bin/python" ]; then
+        if "$venv_path/bin/python" -c "import numpy, pandas, scipy"; then
+            PYTHON_CMD="$venv_path/bin/python"
+            echo "Using Python at $PYTHON_CMD"
             break
         fi
     fi
 done
 
-python3 {restart_script} {spinup_for_restart} {restart_name}
+if [ -z "$PYTHON_CMD" ]; then
+    echo "ERROR: No Python found with numpy, pandas, scipy"
+    exit 1
+fi
+
+"$PYTHON_CMD" {shlex.quote(restart_script)} {shlex.quote(spinup_for_restart)} {shlex.quote(restart_name)} {shlex.quote(p80str)} {shlex.quote(str(application_rate_g_m2_yr))}{' ' + shlex.quote(target_pH_arg) if target_pH_arg else ''}
 EXIT=$?
+
 if [ $EXIT -eq 0 ]; then
     echo "Job completed at $(date)" > {job_folder}/.completed
 fi
+
 exit $EXIT
 """
 
@@ -1923,9 +2148,7 @@ def submit_run_scepter_model_batch():
 
         payload = request.get_json(silent=True) or {}
         locations = (
-            payload.get("locations")
-            or payload.get("sites")
-            or payload.get("location")
+            payload.get("locations") or payload.get("sites") or payload.get("location")
         )
 
         if not locations or not isinstance(locations, list) or len(locations) == 0:
@@ -2177,19 +2400,30 @@ cd {cfg['scepter_path']}
 export SCEPTER_JOBS_DIR={shlex.quote(scepter_jobs_dir)}
 export SCEPTER_RESTART_DIR={shlex.quote(restart_dir_full)}
 
+module purge
+module load GCC/12.2.0
+module load OpenBLAS/0.3.21-GCC-12.2.0
+module load Python/3.10.8-GCCcore-12.2.0
+
+PYTHON_CMD=""
+
 for venv_path in ".venv" "venv" "../venv"; do
-    if [ -f "$venv_path/bin/activate" ]; then
-        if "$venv_path/bin/python" -c "import numpy" 2>/dev/null; then
-            echo "Activating venv at $venv_path (numpy OK)"
-            set +u
-            source "$venv_path/bin/activate"
-            set -u
+    if [ -f "$venv_path/bin/python" ]; then
+        if "$venv_path/bin/python" -c "import numpy, pandas, scipy"; then
+            PYTHON_CMD="$venv_path/bin/python"
+            echo "Using Python at $PYTHON_CMD"
             break
         fi
     fi
 done
 
-python3 {cfg['restart_script']} {cfg['spinup_for_restart']} {cfg['restart_name']} {cfg['p80str']} {cfg['fdust']}{' ' + cfg['target_pH_arg'] if cfg.get('target_pH_arg') else ''}
+if [ -z "$PYTHON_CMD" ]; then
+    echo "ERROR: No Python found with numpy, pandas, scipy"
+    exit 1
+fi
+
+"$PYTHON_CMD" {cfg['restart_script']} {cfg['spinup_for_restart']} {cfg['restart_name']} {cfg['p80str']} {cfg['fdust']}{' ' + cfg['target_pH_arg'] if cfg.get('target_pH_arg') else ''}
+
 EXIT=$?
 if [ $EXIT -eq 0 ]; then
     echo "Job completed at $(date)" > {job_folder}/.completed
@@ -2349,10 +2583,13 @@ def check_run_scepter_model_batch_status(batch_id):
                     "bouchet_job_id": row.get("bouchet_job_id"),
                     "error": row.get("error"),
                     "download_ready": st == "completed",
+                    "resources": row.get("resources"),
+                    "aws_cost_estimate": row.get("aws_cost_estimate"),
                 }
             )
 
         overall = _batch_overall_from_status_counts(status_counts, len(job_ids))
+        usage_summary = _aggregate_batch_usage(jobs_status)
 
         return jsonify(
             {
@@ -2361,6 +2598,7 @@ def check_run_scepter_model_batch_status(batch_id):
                 "jobs": jobs_status,
                 "status_counts": status_counts,
                 "submitted_at": batch_info.get("submitted_at"),
+                "usage_summary": usage_summary,
             }
         )
 
@@ -2525,18 +2763,6 @@ def check_run_scepter_model_status(job_id):
         if not job_id.startswith("scepter_run_"):
             return jsonify({"error": "Invalid run-model job_id", "job_id": job_id}), 400
 
-        if job_info.get("status") == "failed":
-            return (
-                jsonify(
-                    {
-                        "job_id": job_id,
-                        "status": "failed",
-                        "error": job_info.get("error", "Job failed"),
-                    }
-                ),
-                500,
-            )
-
         job_folder = _resolve_run_model_job_folder(job_id, job_info)
         job_info["job_folder"] = job_folder
         JOB_STATUS_CACHE[job_id] = job_info
@@ -2586,6 +2812,9 @@ def check_run_scepter_model_status(job_id):
                 "status": status,
                 "submitted_at": job_info.get("submitted_at"),
                 "logs": logs,
+                "resources": row.get("resources"),
+                "aws_cost_estimate": row.get("aws_cost_estimate"),
+                "error": row.get("error"),
             }
         )
 
