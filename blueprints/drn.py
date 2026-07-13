@@ -16,7 +16,159 @@ from utils.ssh import get_ssh_connection, get_ssh_connection_pooled, BOUCHET_USE
 drn_bp = Blueprint("drn", __name__)
 JOB_STATUS_CACHE = {}  # In production, use Redis or database
 
-# Project root (parent of blueprints/) for finding scripts like 01_site_selection.py
+# DRN SLURM allocation (see #SBATCH in full-pipeline job scripts).
+DRN_SLURM_CPUS_PER_TASK = int(os.getenv("DRN_SLURM_CPUS_PER_TASK", "4"))
+DRN_SLURM_MEM_GB = int(os.getenv("DRN_SLURM_MEM_GB", "32"))
+DRN_AWS_INSTANCE_TYPE = os.getenv("DRN_AWS_INSTANCE_TYPE", "m6i.xlarge")
+DRN_AWS_REGION = os.getenv("DRN_AWS_REGION", "us-east-1")
+DRN_AWS_ON_DEMAND_USD_PER_HR = float(os.getenv("DRN_AWS_ON_DEMAND_USD_PER_HR", "0.192"))
+
+
+def _parse_slurm_elapsed_to_seconds(elapsed):
+    if elapsed is None:
+        return None
+    s = str(elapsed).strip()
+    if not s or s.upper() in ("UNKNOWN", "NONE", "N/A"):
+        return None
+    try:
+        days = 0
+        if "-" in s:
+            day_part, s = s.split("-", 1)
+            days = int(day_part)
+        parts = s.split(":")
+        if len(parts) == 3:
+            hours, minutes, seconds = int(parts[0]), int(parts[1]), int(float(parts[2]))
+        elif len(parts) == 2:
+            hours, minutes, seconds = 0, int(parts[0]), int(float(parts[1]))
+        elif len(parts) == 1:
+            return int(float(parts[0]))
+        else:
+            return None
+        return days * 86400 + hours * 3600 + minutes * 60 + seconds
+    except (ValueError, TypeError):
+        return None
+
+
+def _parse_slurm_max_rss_mb(max_rss):
+    if max_rss is None:
+        return None
+    s = str(max_rss).strip().upper()
+    if not s or s in ("N/A", "NONE"):
+        return None
+    suffix = s[-1]
+    multipliers = {"K": 1 / 1024, "M": 1, "G": 1024, "T": 1024 * 1024}
+    if suffix in multipliers:
+        try:
+            return round(float(s[:-1]) * multipliers[suffix], 1)
+        except ValueError:
+            return None
+    try:
+        return round(float(s) / 1024, 1)
+    except ValueError:
+        return None
+
+
+def _format_duration_seconds(seconds):
+    if seconds is None:
+        return None
+    total = int(seconds)
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
+def _slurm_sacct_usage(ssh, bouchet_job_id):
+    if not ssh or not bouchet_job_id:
+        return {}
+    cmd = (
+        f"sacct -j {bouchet_job_id} -n -X -P "
+        f"-o Elapsed,AllocCPUS,MaxRSS,TotalCPU 2>/dev/null | head -1"
+    )
+    stdin, stdout, stderr = ssh.exec_command(cmd)
+    line = (stdout.read().decode() or "").strip()
+    if not line:
+        return {}
+    parts = line.split("|")
+    while len(parts) < 4:
+        parts.append("")
+    elapsed_raw, alloc_cpus_raw, max_rss_raw, total_cpu_raw = parts[:4]
+    alloc_cpus = None
+    try:
+        if str(alloc_cpus_raw).strip().isdigit():
+            alloc_cpus = int(str(alloc_cpus_raw).strip())
+    except ValueError:
+        pass
+    return {
+        "elapsed_seconds": _parse_slurm_elapsed_to_seconds(elapsed_raw),
+        "elapsed": str(elapsed_raw).strip() or None,
+        "alloc_cpus": alloc_cpus,
+        "max_rss_mb": _parse_slurm_max_rss_mb(max_rss_raw),
+        "max_rss": str(max_rss_raw).strip() or None,
+        "total_cpu_seconds": _parse_slurm_elapsed_to_seconds(total_cpu_raw),
+        "total_cpu": str(total_cpu_raw).strip() or None,
+    }
+
+
+def _build_drn_usage_payload(ssh, bouchet_job_id, submitted_at=None):
+    usage = _slurm_sacct_usage(ssh, bouchet_job_id) if bouchet_job_id else {}
+    elapsed_seconds = usage.get("elapsed_seconds")
+    elapsed_is_estimate = False
+    if elapsed_seconds is None and submitted_at:
+        try:
+            elapsed_seconds = max(0, int(time.time() - float(submitted_at)))
+            elapsed_is_estimate = True
+        except (TypeError, ValueError):
+            elapsed_seconds = None
+
+    aws_hours = (elapsed_seconds / 3600.0) if elapsed_seconds is not None else None
+    aws_cost = (
+        round(aws_hours * DRN_AWS_ON_DEMAND_USD_PER_HR, 4)
+        if aws_hours is not None
+        else None
+    )
+
+    return {
+        "resources": {
+            "requested_cpus": DRN_SLURM_CPUS_PER_TASK,
+            "requested_memory_gb": DRN_SLURM_MEM_GB,
+            "alloc_cpus": usage.get("alloc_cpus") or DRN_SLURM_CPUS_PER_TASK,
+            "max_rss_mb": usage.get("max_rss_mb"),
+            "elapsed_seconds": elapsed_seconds,
+            "elapsed": usage.get("elapsed")
+            or (_format_duration_seconds(elapsed_seconds) if elapsed_seconds is not None else None),
+            "total_cpu_seconds": usage.get("total_cpu_seconds"),
+            "total_cpu": usage.get("total_cpu"),
+            "elapsed_is_estimate": elapsed_is_estimate,
+        },
+        "aws_cost_estimate": {
+            "instance_type": DRN_AWS_INSTANCE_TYPE,
+            "pricing_model": "on_demand",
+            "region": DRN_AWS_REGION,
+            "usd_per_hour": DRN_AWS_ON_DEMAND_USD_PER_HR,
+            "billable_hours": round(aws_hours, 4) if aws_hours is not None else None,
+            "usd": aws_cost,
+            "note": (
+                "Estimate using AWS m6i.xlarge on-demand wall-clock time "
+                "(4 vCPU). Job requests 32 GiB on HPC. Excludes storage and data transfer."
+            ),
+        },
+    }
+
+
+def _finalize_drn_status_payload(ssh, payload):
+    """Attach resources + AWS estimate to any DRN status response body."""
+    if not isinstance(payload, dict):
+        return payload
+    bouchet_job_id = payload.get("bouchet_job_id")
+    submitted_at = payload.get("submitted_at")
+    usage_payload = _build_drn_usage_payload(ssh, bouchet_job_id, submitted_at)
+    payload.update(usage_payload)
+    return payload
+
 _DRN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -439,7 +591,7 @@ def submit_full_drn_pipeline():
                     sbatch_script = f"""#!/bin/bash
     #SBATCH --job-name={job_id[:12]}
     #SBATCH --ntasks=1
-    #SBATCH --cpus-per-task=8
+    #SBATCH --cpus-per-task=4
     #SBATCH --mem=32G
     #SBATCH --time=24:00:00
     #SBATCH --output={job_folder}/%x_%j.out
@@ -787,16 +939,18 @@ def check_full_pipeline_status(job_id):
 
         # Check if job already failed (from background thread)
         if job_info.get("status") == "failed":
-            return (
-                jsonify(
+            return jsonify(
+                _finalize_drn_status_payload(
+                    None,
                     {
                         "job_id": job_id,
                         "status": "failed",
                         "error": job_info.get("error", "Job submission failed"),
                         "message": "Job submission failed. Check backend logs for details.",
-                    }
-                ),
-                500,
+                        "submitted_at": job_info.get("submitted_at"),
+                        "bouchet_job_id": job_info.get("bouchet_job_id"),
+                    },
+                )
             )
 
         bouchet_job_id = job_info.get("bouchet_job_id")
@@ -825,14 +979,17 @@ def check_full_pipeline_status(job_id):
                 f"[Status Check] Job {job_id} - Background submission still in progress (bouchet_job_id=None, time_elapsed: {time_elapsed:.2f}s), skipping SSH connection to avoid race condition"
             )
             return jsonify(
-                {
-                    "job_id": job_id,
-                    "bouchet_job_id": bouchet_job_id,
-                    "status": "submitting",
-                    "message": "Job is being submitted to Bouchet HPC. Please wait...",
-                    "submitted_at": submitted_at,
-                    "logs": [],
-                }
+                _finalize_drn_status_payload(
+                    None,
+                    {
+                        "job_id": job_id,
+                        "bouchet_job_id": bouchet_job_id,
+                        "status": "submitting",
+                        "message": "Job is being submitted to Bouchet HPC. Please wait...",
+                        "submitted_at": submitted_at,
+                        "logs": [],
+                    },
+                )
             )
 
         # Connect to Bouchet via SSH using pooled connection to avoid repeated DUO authentication
@@ -1213,18 +1370,21 @@ def check_full_pipeline_status(job_id):
 
             # Return immediately with current status
             return jsonify(
-                {
-                    "job_id": job_id,
-                    "bouchet_job_id": bouchet_job_id,
-                    "status": status,
-                    "submitted_at": submitted_at,
-                    "logs": [],
-                    "message": (
-                        f"Job submitted successfully to Bouchet HPC with job ID {bouchet_job_id}"
-                        if status == "submitted"
-                        else None
-                    ),
-                }
+                _finalize_drn_status_payload(
+                    ssh,
+                    {
+                        "job_id": job_id,
+                        "bouchet_job_id": bouchet_job_id,
+                        "status": status,
+                        "submitted_at": submitted_at,
+                        "logs": [],
+                        "message": (
+                            f"Job submitted successfully to Bouchet HPC with job ID {bouchet_job_id}"
+                            if status == "submitted"
+                            else None
+                        ),
+                    },
+                )
             )
 
         # If cached status is already "running", "pending", or "completed", don't override it
@@ -1614,7 +1774,7 @@ def check_full_pipeline_status(job_id):
             job_info["error"] = error_message
             JOB_STATUS_CACHE[job_id] = job_info
 
-        return jsonify(response_data)
+        return jsonify(_finalize_drn_status_payload(ssh, response_data))
 
     except Exception as e:
         import traceback
