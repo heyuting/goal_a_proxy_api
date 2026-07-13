@@ -7,10 +7,9 @@ import paramiko
 
 BOUCHET_USER = os.getenv("BOUCHET_USER", "yhs5")
 
-# SSH connection pool to avoid repeated DUO authentication
-_ssh_connection_pool = None
-_ssh_connection_lock = None
-_ssh_connection_last_used = None
+# Per-thread pooled SSH connections (SSHClient is not safe across threads).
+_ssh_thread_local = threading.local()
+_ssh_create_lock = threading.Lock()
 
 
 def get_ssh_connection():
@@ -55,50 +54,70 @@ def get_ssh_connection():
     return ssh
 
 
+def _transport_alive(ssh):
+    if ssh is None:
+        return False
+    transport = ssh.get_transport()
+    if transport is None:
+        return False
+    try:
+        if not transport.is_active():
+            return False
+        if hasattr(transport, "is_alive"):
+            return transport.is_alive()
+        return True
+    except Exception:
+        return False
+
+
+def reset_ssh_connection_pool():
+    """Drop the current thread's pooled SSH connection (e.g. after channel errors)."""
+    conn = getattr(_ssh_thread_local, "ssh", None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    _ssh_thread_local.ssh = None
+    _ssh_thread_local.last_used = None
+
+
+def ssh_exec_read(ssh, cmd, timeout=None):
+    """Run a remote command and fully drain the channel before returning."""
+    kwargs = {}
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    stdin, stdout, stderr = ssh.exec_command(cmd, **kwargs)
+    try:
+        out = stdout.read().decode()
+        stderr.read()
+        stdout.channel.recv_exit_status()
+        return out
+    except Exception:
+        try:
+            stdout.channel.close()
+        except Exception:
+            pass
+        raise
+
+
 def get_ssh_connection_pooled():
-    """Get or reuse SSH connection to avoid repeated DUO authentication"""
-    global _ssh_connection_pool, _ssh_connection_lock, _ssh_connection_last_used
+    """Get or reuse a per-thread SSH connection to avoid repeated DUO auth."""
+    current_time = time.time()
+    conn = getattr(_ssh_thread_local, "ssh", None)
+    last_used = getattr(_ssh_thread_local, "last_used", None)
 
-    if _ssh_connection_lock is None:
-        _ssh_connection_lock = threading.Lock()
+    if conn is not None and _transport_alive(conn):
+        if last_used is None or (current_time - last_used) < 1800:
+            _ssh_thread_local.last_used = current_time
+            return conn
+        try:
+            conn.close()
+        except Exception:
+            pass
 
-    with _ssh_connection_lock:
-        current_time = time.time()
-        if _ssh_connection_pool is not None:
-            connection_alive = False
-            transport = _ssh_connection_pool.get_transport()
-            if transport is not None:
-                try:
-                    connection_alive = transport.is_active()
-                    if connection_alive:
-                        connection_alive = (
-                            transport.is_alive()
-                            if hasattr(transport, "is_alive")
-                            else transport.is_active()
-                        )
-                except Exception:
-                    connection_alive = False
-
-            if connection_alive:
-                if (
-                    _ssh_connection_last_used is None
-                    or (current_time - _ssh_connection_last_used) < 1800
-                ):
-                    _ssh_connection_last_used = current_time
-                    return _ssh_connection_pool
-                else:
-                    try:
-                        _ssh_connection_pool.close()
-                    except Exception:
-                        pass
-                    _ssh_connection_pool = None
-            else:
-                try:
-                    _ssh_connection_pool.close()
-                except Exception:
-                    pass
-                _ssh_connection_pool = None
-
-        _ssh_connection_pool = get_ssh_connection()
-        _ssh_connection_last_used = current_time
-        return _ssh_connection_pool
+    with _ssh_create_lock:
+        conn = get_ssh_connection()
+        _ssh_thread_local.ssh = conn
+        _ssh_thread_local.last_used = current_time
+        return conn

@@ -12,7 +12,13 @@ import re
 import shlex
 import threading
 
-from utils.ssh import get_ssh_connection, get_ssh_connection_pooled, BOUCHET_USER
+from utils.ssh import (
+    get_ssh_connection,
+    get_ssh_connection_pooled,
+    reset_ssh_connection_pool,
+    ssh_exec_read,
+    BOUCHET_USER,
+)
 
 scepter_bp = Blueprint("scepter", __name__)
 JOB_STATUS_CACHE = {}  # job_id -> { job_id, bouchet_job_id, job_folder, status, ... }
@@ -347,8 +353,7 @@ def _slurm_sacct_usage(ssh, bouchet_job_id):
         f"sacct -j {bouchet_job_id} -n -X -P "
         f"-o Elapsed,AllocCPUS,MaxRSS,TotalCPU 2>/dev/null | head -1"
     )
-    stdin, stdout, stderr = ssh.exec_command(cmd)
-    line = (stdout.read().decode() or "").strip()
+    line = ssh_exec_read(ssh, cmd).strip()
     if not line:
         return {}
     parts = line.split("|")
@@ -479,8 +484,7 @@ def _slurm_sacct_resolve_state(ssh, bouchet_job_id):
         f"sacct -j {bouchet_job_id} -n -X -o State -P 2>/dev/null",
         f"sacct -j {bouchet_job_id} -n -o State -P 2>/dev/null",
     ):
-        stdin, stdout, stderr = ssh.exec_command(cmd)
-        out = (stdout.read().decode() or "").strip()
+        out = ssh_exec_read(ssh, cmd).strip()
         if not out:
             continue
         for ln in out.split("\n"):
@@ -505,22 +509,41 @@ def _slurm_sacct_resolve_state(ssh, bouchet_job_id):
 def _run_model_filesystem_completion(ssh, job_folder, restart_name):
     """True if the SLURM wrapper wrote .completed or the ERW run left run_complete.txt."""
     jf = shlex.quote(job_folder.rstrip("/"))
-    stdin, stdout, stderr = ssh.exec_command(f"test -f {jf}/.completed && echo y")
-    if (stdout.read().decode() or "").strip() == "y":
+    if ssh_exec_read(ssh, f"test -f {jf}/.completed && echo y").strip() == "y":
         return True
     if restart_name and isinstance(restart_name, str) and restart_name.strip():
         rel = restart_name.strip().lstrip("/")
         full = f"{job_folder.rstrip('/')}/{rel}"
-        stdin, stdout, stderr = ssh.exec_command(
-            f"test -f {shlex.quote(full)}/run_complete.txt && echo y"
-        )
-        if (stdout.read().decode() or "").strip() == "y":
+        if ssh_exec_read(ssh, f"test -f {shlex.quote(full)}/run_complete.txt && echo y").strip() == "y":
             return True
-    # Same layout as spinup heuristic: any run_complete under the job dir (cache may lack parameters)
-    stdin, stdout, stderr = ssh.exec_command(
-        f"find {jf} -maxdepth 4 -type f -name run_complete.txt 2>/dev/null | head -1"
+    return bool(
+        ssh_exec_read(
+            ssh,
+            f"find {jf} -maxdepth 4 -type f -name run_complete.txt 2>/dev/null | head -1",
+        ).strip()
     )
-    return bool((stdout.read().decode() or "").strip())
+
+
+def _tail_job_logs(ssh, job_folder):
+    """Fetch recent SLURM stdout/stderr tails; never raises on SSH channel errors."""
+    quoted = shlex.quote(job_folder.rstrip("/"))
+    log_cmd = (
+        f"tail -n 50 {quoted}/*.out 2>/dev/null; "
+        f"tail -n 20 {quoted}/*.err 2>/dev/null"
+    )
+    for attempt in range(2):
+        try:
+            log_content = ssh_exec_read(ssh, log_cmd)
+            if log_content:
+                return log_content.split("\n")[-15:]
+            return []
+        except Exception:
+            if attempt == 0:
+                reset_ssh_connection_pool()
+                ssh = get_ssh_connection_pooled()
+                continue
+            return []
+    return []
 
 
 def _batch_overall_from_status_counts(status_counts, n_jobs):
@@ -574,8 +597,7 @@ def _refresh_baseline_job_live(ssh, job_id, batch_folder=None):
 
     if not bouchet_job_id:
         check = f"test -d {job_folder} && echo exists || echo not_found"
-        stdin, stdout, stderr = ssh.exec_command(check)
-        if stdout.read().decode().strip() == "not_found":
+        if ssh_exec_read(ssh, check).strip() == "not_found":
             discovered = _discover_baseline_job_folder_ssh(ssh, job_id)
             if discovered:
                 job_folder = discovered
@@ -603,16 +625,14 @@ def _refresh_baseline_job_live(ssh, job_id, batch_folder=None):
                     "error": job_info.get("error"),
                 }
         read_cmd = f"cat {job_folder}/.bouchet_job_id 2>/dev/null || (grep -h 'Submitted batch job' {job_folder}/*.out 2>/dev/null | tail -1 | awk '{{print $NF}}')"
-        stdin, stdout, stderr = ssh.exec_command(read_cmd)
-        recovered = stdout.read().decode().strip()
+        recovered = ssh_exec_read(ssh, read_cmd).strip()
         if recovered:
             bouchet_job_id = recovered
             job_info["bouchet_job_id"] = bouchet_job_id
             JOB_STATUS_CACHE[job_id] = job_info
         else:
             check_done = f"test -f {job_folder}/.completed && echo completed || echo not_completed"
-            stdin, stdout, stderr = ssh.exec_command(check_done)
-            if stdout.read().decode().strip() == "completed":
+            if ssh_exec_read(ssh, check_done).strip() == "completed":
                 job_info["status"] = "completed"
                 JOB_STATUS_CACHE[job_id] = job_info
                 return {
@@ -637,21 +657,18 @@ def _refresh_baseline_job_live(ssh, job_id, batch_folder=None):
         status = acct_m
     else:
         squeue_cmd = f"squeue -j {bouchet_job_id} --format='%T' --noheader"
-        stdin, stdout, stderr = ssh.exec_command(squeue_cmd)
-        slurm_status = (stdout.read().decode().strip().split("\n")[0] or "").strip()
+        slurm_status = (ssh_exec_read(ssh, squeue_cmd).strip().split("\n")[0] or "").strip()
         if slurm_status:
             status = _slurm_raw_to_status(slurm_status)
         else:
             check_done = f"test -f {job_folder}/.completed && echo completed || echo not_completed"
-            stdin, stdout, stderr = ssh.exec_command(check_done)
-            done = stdout.read().decode().strip() == "completed"
+            done = ssh_exec_read(ssh, check_done).strip() == "completed"
             status = "completed" if done else ("unknown" if not sacct_st else acct_m)
 
     if status == "running":
-        stdin, stdout, stderr = ssh.exec_command(
-            f"test -f {shlex.quote(job_folder.rstrip('/'))}/.completed && echo y"
-        )
-        if (stdout.read().decode() or "").strip() == "y":
+        if ssh_exec_read(
+            ssh, f"test -f {shlex.quote(job_folder.rstrip('/'))}/.completed && echo y"
+        ).strip() == "y":
             status = "completed"
 
     job_info["status"] = status
@@ -692,8 +709,7 @@ def _refresh_run_model_job_live(ssh, job_id):
 
     if not bouchet_job_id:
         check = f"test -d {job_folder} && echo exists || echo not_found"
-        stdin, stdout, stderr = ssh.exec_command(check)
-        if stdout.read().decode().strip() == "not_found":
+        if ssh_exec_read(ssh, check).strip() == "not_found":
             discovered = _discover_baseline_job_folder_ssh(ssh, job_id)
             if discovered:
                 job_folder = discovered
@@ -721,16 +737,14 @@ def _refresh_run_model_job_live(ssh, job_id):
                     "error": job_info.get("error"),
                 }
         read_cmd = f"cat {job_folder}/.bouchet_job_id 2>/dev/null || (grep -h 'Submitted batch job' {job_folder}/*.out 2>/dev/null | tail -1 | awk '{{print $NF}}')"
-        stdin, stdout, stderr = ssh.exec_command(read_cmd)
-        recovered = stdout.read().decode().strip()
+        recovered = ssh_exec_read(ssh, read_cmd).strip()
         if recovered:
             bouchet_job_id = recovered.split()[0].strip()
             job_info["bouchet_job_id"] = bouchet_job_id
             JOB_STATUS_CACHE[job_id] = job_info
         else:
             check_done = f"test -f {job_folder}/.completed && echo completed || echo not_completed"
-            stdin, stdout, stderr = ssh.exec_command(check_done)
-            if stdout.read().decode().strip() == "completed":
+            if ssh_exec_read(ssh, check_done).strip() == "completed":
                 job_info["status"] = "completed"
                 JOB_STATUS_CACHE[job_id] = job_info
                 return {
@@ -757,14 +771,12 @@ def _refresh_run_model_job_live(ssh, job_id):
         status = acct_m
     else:
         squeue_cmd = f"squeue -j {bouchet_job_id} --format='%T' --noheader"
-        stdin, stdout, stderr = ssh.exec_command(squeue_cmd)
-        slurm_status = (stdout.read().decode().strip().split("\n")[0] or "").strip()
+        slurm_status = (ssh_exec_read(ssh, squeue_cmd).strip().split("\n")[0] or "").strip()
         if slurm_status:
             status = _slurm_raw_to_status(slurm_status)
         else:
             check_done = f"test -f {job_folder}/.completed && echo completed || echo not_completed"
-            stdin, stdout, stderr = ssh.exec_command(check_done)
-            done = stdout.read().decode().strip() == "completed"
+            done = ssh_exec_read(ssh, check_done).strip() == "completed"
             status = "completed" if done else ("unknown" if not sacct_st else acct_m)
 
     if status == "running":
@@ -848,8 +860,7 @@ def _discover_baseline_job_folder_ssh(ssh, job_id):
     """Locate job directory on Bouchet (handles batch nesting when cache is stale)."""
     root = _baseline_jobs_root()
     cmd = f"find {root} -maxdepth 3 -type d -name '{job_id}' 2>/dev/null | head -1"
-    stdin, stdout, stderr = ssh.exec_command(cmd)
-    return stdout.read().decode().strip()
+    return ssh_exec_read(ssh, cmd).strip()
 
 
 # ---------------------------------------------------------------------------
@@ -1637,11 +1648,7 @@ def check_baseline_simulation_status(job_id):
 
         logs = []
         if status in ["running", "completed", "failed"]:
-            log_cmd = f"tail -n 50 {job_folder}/*.out 2>/dev/null; tail -n 20 {job_folder}/*.err 2>/dev/null"
-            stdin, stdout, stderr = ssh.exec_command(log_cmd)
-            log_content = stdout.read().decode()
-            if log_content:
-                logs = log_content.split("\n")[-15:]
+            logs = _tail_job_logs(ssh, job_folder)
 
         return jsonify(
             {
@@ -2798,13 +2805,8 @@ def check_run_scepter_model_status(job_id):
 
         logs = []
         if status in ["running", "completed", "failed"]:
-            log_cmd = f"tail -n 50 {job_folder}/*.out 2>/dev/null; tail -n 20 {job_folder}/*.err 2>/dev/null"
-            stdin, stdout, stderr = ssh.exec_command(log_cmd)
-            log_content = stdout.read().decode()
-            if log_content:
-                logs = log_content.split("\n")[-15:]
+            logs = _tail_job_logs(ssh, job_folder)
 
-        ssh.close()
         return jsonify(
             {
                 "job_id": job_id,
