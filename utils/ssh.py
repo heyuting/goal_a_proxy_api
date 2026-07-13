@@ -1,4 +1,5 @@
 """SSH connection utilities for Bouchet HPC."""
+import contextlib
 import io
 import os
 import time
@@ -7,13 +8,15 @@ import paramiko
 
 BOUCHET_USER = os.getenv("BOUCHET_USER", "yhs5")
 
-# Per-thread pooled SSH connections (SSHClient is not safe across threads).
-_ssh_thread_local = threading.local()
-_ssh_create_lock = threading.Lock()
+# One shared Bouchet SSH session per API process (avoids repeated Duo prompts).
+# Access is serialized with a lock because SSHClient is not thread-safe.
+_ssh_pool_conn = None
+_ssh_pool_last_used = None
+_ssh_pool_lock = threading.RLock()
 
 
 def get_ssh_connection():
-    """Create SSH connection to Bouchet server"""
+    """Create a new SSH connection to Bouchet (triggers Duo)."""
     ssh = paramiko.SSHClient()
     ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
@@ -70,16 +73,58 @@ def _transport_alive(ssh):
         return False
 
 
-def reset_ssh_connection_pool():
-    """Drop the current thread's pooled SSH connection (e.g. after channel errors)."""
-    conn = getattr(_ssh_thread_local, "ssh", None)
-    if conn is not None:
+def _ensure_pooled_connection():
+    """Return the shared connection, creating it if needed. Caller must hold _ssh_pool_lock."""
+    global _ssh_pool_conn, _ssh_pool_last_used
+    current_time = time.time()
+    if _ssh_pool_conn is not None and _transport_alive(_ssh_pool_conn):
+        if _ssh_pool_last_used is None or (current_time - _ssh_pool_last_used) < 1800:
+            return _ssh_pool_conn
         try:
-            conn.close()
+            _ssh_pool_conn.close()
         except Exception:
             pass
-    _ssh_thread_local.ssh = None
-    _ssh_thread_local.last_used = None
+        _ssh_pool_conn = None
+    elif _ssh_pool_conn is not None:
+        try:
+            _ssh_pool_conn.close()
+        except Exception:
+            pass
+        _ssh_pool_conn = None
+
+    _ssh_pool_conn = get_ssh_connection()
+    return _ssh_pool_conn
+
+
+def reset_ssh_connection_pool():
+    """Drop the shared SSH connection (e.g. after channel errors)."""
+    global _ssh_pool_conn, _ssh_pool_last_used
+    with _ssh_pool_lock:
+        if _ssh_pool_conn is not None:
+            try:
+                _ssh_pool_conn.close()
+            except Exception:
+                pass
+        _ssh_pool_conn = None
+        _ssh_pool_last_used = None
+
+
+@contextlib.contextmanager
+def bouchet_ssh_session():
+    """Reuse one Bouchet SSH login across requests; safe for concurrent Flask threads."""
+    global _ssh_pool_last_used
+    with _ssh_pool_lock:
+        ssh = _ensure_pooled_connection()
+        try:
+            yield ssh
+        finally:
+            _ssh_pool_last_used = time.time()
+
+
+def get_ssh_connection_pooled():
+    """Deprecated: use bouchet_ssh_session() so the pool lock is held for the whole operation."""
+    with _ssh_pool_lock:
+        return _ensure_pooled_connection()
 
 
 def ssh_exec_read(ssh, cmd, timeout=None):
@@ -99,25 +144,3 @@ def ssh_exec_read(ssh, cmd, timeout=None):
         except Exception:
             pass
         raise
-
-
-def get_ssh_connection_pooled():
-    """Get or reuse a per-thread SSH connection to avoid repeated DUO auth."""
-    current_time = time.time()
-    conn = getattr(_ssh_thread_local, "ssh", None)
-    last_used = getattr(_ssh_thread_local, "last_used", None)
-
-    if conn is not None and _transport_alive(conn):
-        if last_used is None or (current_time - last_used) < 1800:
-            _ssh_thread_local.last_used = current_time
-            return conn
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-    with _ssh_create_lock:
-        conn = get_ssh_connection()
-        _ssh_thread_local.ssh = conn
-        _ssh_thread_local.last_used = current_time
-        return conn

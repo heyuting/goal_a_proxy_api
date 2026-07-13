@@ -14,7 +14,7 @@ import threading
 
 from utils.ssh import (
     get_ssh_connection,
-    get_ssh_connection_pooled,
+    bouchet_ssh_session,
     reset_ssh_connection_pool,
     ssh_exec_read,
     BOUCHET_USER,
@@ -531,18 +531,12 @@ def _tail_job_logs(ssh, job_folder):
         f"tail -n 50 {quoted}/*.out 2>/dev/null; "
         f"tail -n 20 {quoted}/*.err 2>/dev/null"
     )
-    for attempt in range(2):
-        try:
-            log_content = ssh_exec_read(ssh, log_cmd)
-            if log_content:
-                return log_content.split("\n")[-15:]
-            return []
-        except Exception:
-            if attempt == 0:
-                reset_ssh_connection_pool()
-                ssh = get_ssh_connection_pooled()
-                continue
-            return []
+    try:
+        log_content = ssh_exec_read(ssh, log_cmd)
+        if log_content:
+            return log_content.split("\n")[-15:]
+    except Exception:
+        pass
     return []
 
 
@@ -946,7 +940,7 @@ def submit_baseline_simulation():
                     current_app.logger.info(
                         f"Starting baseline simulation job {job_id}"
                     )
-                    ssh = get_ssh_connection_pooled()
+                    ssh = get_ssh_connection()
 
                     params_data = {
                         "coordinate": [lat, lon],
@@ -1208,7 +1202,7 @@ def submit_baseline_simulation_batch():
             with app.app_context():
                 ssh = None
                 try:
-                    ssh = get_ssh_connection_pooled()
+                    ssh = get_ssh_connection()
                     manifest_data = {
                         "batch_id": batch_id,
                         "job_ids": job_ids,
@@ -1394,7 +1388,7 @@ exit 0
     methods=["GET", "OPTIONS"],
 )
 def check_baseline_simulation_batch_status(batch_id):
-    """Check status for a baseline-simulation batch (in-memory cache only; no SSH)."""
+    """Check status for a baseline-simulation batch; refreshes all jobs over one SSH session."""
     if request.method == "OPTIONS":
         response = make_response()
         response.headers.add("Access-Control-Allow-Origin", "*")
@@ -1412,6 +1406,7 @@ def check_baseline_simulation_batch_status(batch_id):
 
     batch_info = BATCH_JOB_CACHE.get(resolved, {})
     job_ids = batch_info.get("job_ids", [])
+    batch_folder = batch_info.get("batch_folder")
     if not resolved.startswith("baseline_batch_"):
         return jsonify({"error": "Invalid batch_id", "batch_id": batch_id}), 400
     if not job_ids:
@@ -1428,32 +1423,51 @@ def check_baseline_simulation_batch_status(batch_id):
             404,
         )
 
-    jobs_status = []
-    status_counts = {}
-    for jid in job_ids:
-        info = JOB_STATUS_CACHE.get(jid, {})
-        st = info.get("status", "unknown")
-        status_counts[st] = status_counts.get(st, 0) + 1
-        jobs_status.append(
-            {
-                "job_id": jid,
-                "status": st,
-                "bouchet_job_id": info.get("bouchet_job_id"),
-                "error": info.get("error"),
-            }
+    try:
+        with bouchet_ssh_session() as ssh:
+            jobs_status = []
+            status_counts = {}
+            for jid in job_ids:
+                row = _refresh_baseline_job_live(
+                    ssh, jid, batch_folder=batch_folder
+                )
+                st = row["status"]
+                status_counts[st] = status_counts.get(st, 0) + 1
+                jobs_status.append(
+                    {
+                        "job_id": row["job_id"],
+                        "status": row["status"],
+                        "bouchet_job_id": row.get("bouchet_job_id"),
+                        "error": row.get("error"),
+                        "resources": row.get("resources"),
+                        "aws_cost_estimate": row.get("aws_cost_estimate"),
+                    }
+                )
+
+            overall = _batch_overall_from_status_counts(status_counts, len(job_ids))
+            usage_summary = _aggregate_batch_usage(jobs_status)
+
+            return jsonify(
+                {
+                    "batch_id": resolved,
+                    "overall": overall,
+                    "jobs": jobs_status,
+                    "status_counts": status_counts,
+                    "submitted_at": batch_info.get("submitted_at"),
+                    "usage_summary": usage_summary,
+                }
+            )
+    except Exception as e:
+        return (
+            jsonify(
+                {
+                    "batch_id": resolved,
+                    "error": str(e),
+                    "message": "Could not refresh batch status (SSH unavailable).",
+                }
+            ),
+            500,
         )
-
-    overall = _batch_overall_from_status_counts(status_counts, len(job_ids))
-
-    return jsonify(
-        {
-            "batch_id": resolved,
-            "overall": overall,
-            "jobs": jobs_status,
-            "status_counts": status_counts,
-            "submitted_at": batch_info.get("submitted_at"),
-        }
-    )
 
 
 @scepter_bp.route(
@@ -1489,7 +1503,56 @@ def download_baseline_simulation_batch_results(batch_id):
         )
 
         try:
-            ssh = get_ssh_connection_pooled()
+            with bouchet_ssh_session() as ssh:
+                chk = f"test -d {batch_folder} && echo ok || echo missing"
+                stdin, stdout, stderr = ssh.exec_command(chk)
+                if stdout.read().decode().strip() != "ok":
+                    return (
+                        jsonify(
+                            {
+                                "error": "Batch folder not found on Bouchet",
+                                "batch_id": resolved,
+                                "batch_folder": batch_folder,
+                            }
+                        ),
+                        404,
+                    )
+
+                parent_dir = os.path.dirname(batch_folder.rstrip("/")) or "."
+                folder_name = os.path.basename(batch_folder.rstrip("/"))
+                zip_cmd = f"cd {parent_dir} && zip -r {folder_name}.zip {folder_name}/ 2>&1"
+                stdin, stdout, stderr = ssh.exec_command(zip_cmd, timeout=180)
+                exit_status = stdout.channel.recv_exit_status()
+                zip_output = stdout.read().decode()
+                error_msg = stderr.read().decode()
+
+                if exit_status != 0:
+                    current_app.logger.error(
+                        f"Failed to create baseline batch zip for {batch_id}: {error_msg or zip_output}"
+                    )
+                    return (
+                        jsonify(
+                            {
+                                "error": f"Failed to create zip on Bouchet: {error_msg or zip_output}",
+                                "batch_id": batch_id,
+                            }
+                        ),
+                        500,
+                    )
+
+                sftp = ssh.open_sftp()
+                zip_path = f"{parent_dir}/{folder_name}.zip"
+                remote_file = sftp.open(zip_path, "rb")
+                zip_data = remote_file.read()
+                remote_file.close()
+                sftp.close()
+
+                response = make_response(zip_data)
+                response.headers["Content-Type"] = "application/zip"
+                response.headers["Content-Disposition"] = (
+                    f"attachment; filename={folder_name}.zip"
+                )
+                return response
         except Exception as ssh_error:
             error_msg = str(ssh_error)
             current_app.logger.error(
@@ -1514,56 +1577,6 @@ def download_baseline_simulation_batch_results(batch_id):
                 ),
                 500,
             )
-
-        chk = f"test -d {batch_folder} && echo ok || echo missing"
-        stdin, stdout, stderr = ssh.exec_command(chk)
-        if stdout.read().decode().strip() != "ok":
-            return (
-                jsonify(
-                    {
-                        "error": "Batch folder not found on Bouchet",
-                        "batch_id": resolved,
-                        "batch_folder": batch_folder,
-                    }
-                ),
-                404,
-            )
-
-        parent_dir = os.path.dirname(batch_folder.rstrip("/")) or "."
-        folder_name = os.path.basename(batch_folder.rstrip("/"))
-        zip_cmd = f"cd {parent_dir} && zip -r {folder_name}.zip {folder_name}/ 2>&1"
-        stdin, stdout, stderr = ssh.exec_command(zip_cmd, timeout=180)
-        exit_status = stdout.channel.recv_exit_status()
-        zip_output = stdout.read().decode()
-        error_msg = stderr.read().decode()
-
-        if exit_status != 0:
-            current_app.logger.error(
-                f"Failed to create baseline batch zip for {batch_id}: {error_msg or zip_output}"
-            )
-            return (
-                jsonify(
-                    {
-                        "error": f"Failed to create zip on Bouchet: {error_msg or zip_output}",
-                        "batch_id": batch_id,
-                    }
-                ),
-                500,
-            )
-
-        sftp = ssh.open_sftp()
-        zip_path = f"{parent_dir}/{folder_name}.zip"
-        remote_file = sftp.open(zip_path, "rb")
-        zip_data = remote_file.read()
-        remote_file.close()
-        sftp.close()
-
-        response = make_response(zip_data)
-        response.headers["Content-Type"] = "application/zip"
-        response.headers["Content-Disposition"] = (
-            f"attachment; filename={folder_name}.zip"
-        )
-        return response
 
     except Exception as e:
         error_msg = str(e)
@@ -1618,7 +1631,32 @@ def check_baseline_simulation_status(job_id):
         bouchet_job_id = job_info.get("bouchet_job_id")
 
         try:
-            ssh = get_ssh_connection_pooled()
+            with bouchet_ssh_session() as ssh:
+                row = _refresh_baseline_job_live(ssh, job_id)
+                status = row["status"]
+                bouchet_job_id = row.get("bouchet_job_id")
+                job_info = JOB_STATUS_CACHE.get(job_id, {})
+                job_folder = job_info.get(
+                    "job_folder",
+                    f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/SCEPTER/jobs/{job_id}",
+                )
+
+                logs = []
+                if status in ["running", "completed", "failed"]:
+                    logs = _tail_job_logs(ssh, job_folder)
+
+                return jsonify(
+                    {
+                        "job_id": job_id,
+                        "bouchet_job_id": bouchet_job_id,
+                        "status": status,
+                        "submitted_at": job_info.get("submitted_at"),
+                        "logs": logs,
+                        "resources": row.get("resources"),
+                        "aws_cost_estimate": row.get("aws_cost_estimate"),
+                        "error": row.get("error"),
+                    }
+                )
         except Exception as e:
             # SSH failed (e.g. Duo timeout); return cached status if we have one
             if bouchet_job_id or job_info:
@@ -1636,32 +1674,6 @@ def check_baseline_simulation_status(job_id):
                 jsonify({"job_id": job_id, "status": "unknown", "error": str(e)}),
                 500,
             )
-
-        row = _refresh_baseline_job_live(ssh, job_id)
-        status = row["status"]
-        bouchet_job_id = row.get("bouchet_job_id")
-        job_info = JOB_STATUS_CACHE.get(job_id, {})
-        job_folder = job_info.get(
-            "job_folder",
-            f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/SCEPTER/jobs/{job_id}",
-        )
-
-        logs = []
-        if status in ["running", "completed", "failed"]:
-            logs = _tail_job_logs(ssh, job_folder)
-
-        return jsonify(
-            {
-                "job_id": job_id,
-                "bouchet_job_id": bouchet_job_id,
-                "status": status,
-                "submitted_at": job_info.get("submitted_at"),
-                "logs": logs,
-                "resources": row.get("resources"),
-                "aws_cost_estimate": row.get("aws_cost_estimate"),
-                "error": row.get("error"),
-            }
-        )
 
     except Exception as e:
         import traceback
@@ -1703,7 +1715,53 @@ def download_baseline_simulation_results(job_id):
         job_folder = _resolve_baseline_job_folder_from_cache(job_id, job_info)
 
         try:
-            ssh = get_ssh_connection_pooled()
+            with bouchet_ssh_session() as ssh:
+                check = f"test -d {job_folder} && echo exists || echo not_found"
+                stdin, stdout, stderr = ssh.exec_command(check)
+                if stdout.read().decode().strip() == "not_found":
+                    discovered = _discover_baseline_job_folder_ssh(ssh, job_id)
+                    if discovered:
+                        job_folder = discovered
+                        job_info["job_folder"] = job_folder
+                        JOB_STATUS_CACHE[job_id] = job_info
+                    else:
+                        return jsonify({"error": "Job folder not found", "job_id": job_id}), 404
+
+                parent_dir = os.path.dirname(job_folder.rstrip("/")) or "."
+                folder_name = os.path.basename(job_folder.rstrip("/"))
+                zip_cmd = f"cd {parent_dir} && zip -r {folder_name}.zip {folder_name}/ 2>&1"
+                stdin, stdout, stderr = ssh.exec_command(zip_cmd, timeout=120)
+                exit_status = stdout.channel.recv_exit_status()
+                zip_output = stdout.read().decode()
+                error_msg = stderr.read().decode()
+
+                if exit_status != 0:
+                    current_app.logger.error(
+                        f"Failed to create baseline zip for {job_id}: {error_msg or zip_output}"
+                    )
+                    return (
+                        jsonify(
+                            {
+                                "error": f"Failed to create zip on Bouchet: {error_msg or zip_output}",
+                                "job_id": job_id,
+                            }
+                        ),
+                        500,
+                    )
+
+                sftp = ssh.open_sftp()
+                zip_path = f"{parent_dir}/{folder_name}.zip"
+                remote_file = sftp.open(zip_path, "rb")
+                zip_data = remote_file.read()
+                remote_file.close()
+                sftp.close()
+
+                response = make_response(zip_data)
+                response.headers["Content-Type"] = "application/zip"
+                response.headers["Content-Disposition"] = (
+                    f"attachment; filename={folder_name}.zip"
+                )
+                return response
         except Exception as ssh_error:
             error_msg = str(ssh_error)
             current_app.logger.error(
@@ -1728,56 +1786,6 @@ def download_baseline_simulation_results(job_id):
                 ),
                 500,
             )
-
-        check = f"test -d {job_folder} && echo exists || echo not_found"
-        stdin, stdout, stderr = ssh.exec_command(check)
-        if stdout.read().decode().strip() == "not_found":
-            discovered = _discover_baseline_job_folder_ssh(ssh, job_id)
-            if discovered:
-                job_folder = discovered
-                job_info["job_folder"] = job_folder
-                JOB_STATUS_CACHE[job_id] = job_info
-            else:
-                return jsonify({"error": "Job folder not found", "job_id": job_id}), 404
-
-        # Create a zip of the baseline_* folder on Bouchet.
-        # This will work even if the job is still running; it zips whatever files exist.
-        parent_dir = os.path.dirname(job_folder.rstrip("/")) or "."
-        folder_name = os.path.basename(job_folder.rstrip("/"))
-        zip_cmd = f"cd {parent_dir} && zip -r {folder_name}.zip {folder_name}/ 2>&1"
-        stdin, stdout, stderr = ssh.exec_command(zip_cmd, timeout=120)
-        exit_status = stdout.channel.recv_exit_status()
-        zip_output = stdout.read().decode()
-        error_msg = stderr.read().decode()
-
-        if exit_status != 0:
-            current_app.logger.error(
-                f"Failed to create baseline zip for {job_id}: {error_msg or zip_output}"
-            )
-            return (
-                jsonify(
-                    {
-                        "error": f"Failed to create zip on Bouchet: {error_msg or zip_output}",
-                        "job_id": job_id,
-                    }
-                ),
-                500,
-            )
-
-        # Download the zip file over SFTP into memory
-        sftp = ssh.open_sftp()
-        zip_path = f"{parent_dir}/{folder_name}.zip"
-        remote_file = sftp.open(zip_path, "rb")
-        zip_data = remote_file.read()
-        remote_file.close()
-        sftp.close()
-
-        response = make_response(zip_data)
-        response.headers["Content-Type"] = "application/zip"
-        response.headers["Content-Disposition"] = (
-            f"attachment; filename={folder_name}.zip"
-        )
-        return response
 
     except Exception as e:
         error_msg = str(e)
@@ -2564,7 +2572,38 @@ def check_run_scepter_model_batch_status(batch_id):
             return jsonify({"error": "Batch not found", "batch_id": resolved}), 404
 
         try:
-            ssh = get_ssh_connection_pooled()
+            with bouchet_ssh_session() as ssh:
+                jobs_status = []
+                status_counts = {}
+                for jid in job_ids:
+                    row = _refresh_run_model_job_live(ssh, jid)
+                    st = row["status"]
+                    status_counts[st] = status_counts.get(st, 0) + 1
+                    jobs_status.append(
+                        {
+                            "job_id": row["job_id"],
+                            "status": row["status"],
+                            "bouchet_job_id": row.get("bouchet_job_id"),
+                            "error": row.get("error"),
+                            "download_ready": st == "completed",
+                            "resources": row.get("resources"),
+                            "aws_cost_estimate": row.get("aws_cost_estimate"),
+                        }
+                    )
+
+                overall = _batch_overall_from_status_counts(status_counts, len(job_ids))
+                usage_summary = _aggregate_batch_usage(jobs_status)
+
+                return jsonify(
+                    {
+                        "batch_id": resolved,
+                        "overall": overall,
+                        "jobs": jobs_status,
+                        "status_counts": status_counts,
+                        "submitted_at": batch_info.get("submitted_at"),
+                        "usage_summary": usage_summary,
+                    }
+                )
         except Exception as e:
             return (
                 jsonify(
@@ -2576,38 +2615,6 @@ def check_run_scepter_model_batch_status(batch_id):
                 ),
                 500,
             )
-
-        jobs_status = []
-        status_counts = {}
-        for jid in job_ids:
-            row = _refresh_run_model_job_live(ssh, jid)
-            st = row["status"]
-            status_counts[st] = status_counts.get(st, 0) + 1
-            jobs_status.append(
-                {
-                    "job_id": row["job_id"],
-                    "status": row["status"],
-                    "bouchet_job_id": row.get("bouchet_job_id"),
-                    "error": row.get("error"),
-                    "download_ready": st == "completed",
-                    "resources": row.get("resources"),
-                    "aws_cost_estimate": row.get("aws_cost_estimate"),
-                }
-            )
-
-        overall = _batch_overall_from_status_counts(status_counts, len(job_ids))
-        usage_summary = _aggregate_batch_usage(jobs_status)
-
-        return jsonify(
-            {
-                "batch_id": resolved,
-                "overall": overall,
-                "jobs": jobs_status,
-                "status_counts": status_counts,
-                "submitted_at": batch_info.get("submitted_at"),
-                "usage_summary": usage_summary,
-            }
-        )
 
     except Exception as e:
         current_app.logger.error(
@@ -2648,7 +2655,59 @@ def download_run_scepter_model_batch_results(batch_id):
         )
 
         try:
-            ssh = get_ssh_connection_pooled()
+            with bouchet_ssh_session() as ssh:
+                chk = f"test -d {shlex.quote(batch_folder)} && echo ok || echo missing"
+                stdin, stdout, stderr = ssh.exec_command(chk)
+                if stdout.read().decode().strip() != "ok":
+                    return (
+                        jsonify(
+                            {
+                                "error": "Batch folder not found on Bouchet",
+                                "batch_id": resolved,
+                                "batch_folder": batch_folder,
+                            }
+                        ),
+                        404,
+                    )
+
+                parent_dir = os.path.dirname(batch_folder.rstrip("/")) or "."
+                folder_name = os.path.basename(batch_folder.rstrip("/"))
+                zip_cmd = (
+                    f"cd {shlex.quote(parent_dir)} && zip -r {shlex.quote(folder_name)}.zip "
+                    f"{shlex.quote(folder_name)}/ 2>&1"
+                )
+                stdin, stdout, stderr = ssh.exec_command(zip_cmd, timeout=300)
+                exit_status = stdout.channel.recv_exit_status()
+                zip_output = stdout.read().decode()
+                error_msg = stderr.read().decode()
+
+                if exit_status != 0:
+                    current_app.logger.error(
+                        f"Failed to create run-model batch zip for {batch_id}: {error_msg or zip_output}"
+                    )
+                    return (
+                        jsonify(
+                            {
+                                "error": f"Failed to create zip on Bouchet: {error_msg or zip_output}",
+                                "batch_id": batch_id,
+                            }
+                        ),
+                        500,
+                    )
+
+                sftp = ssh.open_sftp()
+                zip_path = f"{parent_dir}/{folder_name}.zip"
+                remote_file = sftp.open(zip_path, "rb")
+                zip_data = remote_file.read()
+                remote_file.close()
+                sftp.close()
+
+                response = make_response(zip_data)
+                response.headers["Content-Type"] = "application/zip"
+                response.headers["Content-Disposition"] = (
+                    f"attachment; filename={folder_name}.zip"
+                )
+                return response
         except Exception as ssh_error:
             error_msg = str(ssh_error)
             current_app.logger.error(
@@ -2673,59 +2732,6 @@ def download_run_scepter_model_batch_results(batch_id):
                 ),
                 500,
             )
-
-        chk = f"test -d {shlex.quote(batch_folder)} && echo ok || echo missing"
-        stdin, stdout, stderr = ssh.exec_command(chk)
-        if stdout.read().decode().strip() != "ok":
-            return (
-                jsonify(
-                    {
-                        "error": "Batch folder not found on Bouchet",
-                        "batch_id": resolved,
-                        "batch_folder": batch_folder,
-                    }
-                ),
-                404,
-            )
-
-        parent_dir = os.path.dirname(batch_folder.rstrip("/")) or "."
-        folder_name = os.path.basename(batch_folder.rstrip("/"))
-        zip_cmd = (
-            f"cd {shlex.quote(parent_dir)} && zip -r {shlex.quote(folder_name)}.zip "
-            f"{shlex.quote(folder_name)}/ 2>&1"
-        )
-        stdin, stdout, stderr = ssh.exec_command(zip_cmd, timeout=300)
-        exit_status = stdout.channel.recv_exit_status()
-        zip_output = stdout.read().decode()
-        error_msg = stderr.read().decode()
-
-        if exit_status != 0:
-            current_app.logger.error(
-                f"Failed to create run-model batch zip for {batch_id}: {error_msg or zip_output}"
-            )
-            return (
-                jsonify(
-                    {
-                        "error": f"Failed to create zip on Bouchet: {error_msg or zip_output}",
-                        "batch_id": batch_id,
-                    }
-                ),
-                500,
-            )
-
-        sftp = ssh.open_sftp()
-        zip_path = f"{parent_dir}/{folder_name}.zip"
-        remote_file = sftp.open(zip_path, "rb")
-        zip_data = remote_file.read()
-        remote_file.close()
-        sftp.close()
-
-        response = make_response(zip_data)
-        response.headers["Content-Type"] = "application/zip"
-        response.headers["Content-Disposition"] = (
-            f"attachment; filename={folder_name}.zip"
-        )
-        return response
 
     except Exception as e:
         error_msg = str(e)
@@ -2776,7 +2782,32 @@ def check_run_scepter_model_status(job_id):
         bouchet_job_id = job_info.get("bouchet_job_id")
 
         try:
-            ssh = get_ssh_connection_pooled()
+            with bouchet_ssh_session() as ssh:
+                row = _refresh_run_model_job_live(ssh, job_id)
+                status = row["status"]
+                bouchet_job_id = row.get("bouchet_job_id")
+                job_info = JOB_STATUS_CACHE.get(job_id, {})
+                job_folder = job_info.get(
+                    "job_folder",
+                    _resolve_run_model_job_folder(job_id, job_info),
+                )
+
+                logs = []
+                if status in ["running", "completed", "failed"]:
+                    logs = _tail_job_logs(ssh, job_folder)
+
+                return jsonify(
+                    {
+                        "job_id": job_id,
+                        "bouchet_job_id": bouchet_job_id,
+                        "status": status,
+                        "submitted_at": job_info.get("submitted_at"),
+                        "logs": logs,
+                        "resources": row.get("resources"),
+                        "aws_cost_estimate": row.get("aws_cost_estimate"),
+                        "error": row.get("error"),
+                    }
+                )
         except Exception as e:
             if bouchet_job_id or job_info:
                 cached = job_info.get("status", "submitting")
@@ -2793,32 +2824,6 @@ def check_run_scepter_model_status(job_id):
                 jsonify({"job_id": job_id, "status": "unknown", "error": str(e)}),
                 500,
             )
-
-        row = _refresh_run_model_job_live(ssh, job_id)
-        status = row["status"]
-        bouchet_job_id = row.get("bouchet_job_id")
-        job_info = JOB_STATUS_CACHE.get(job_id, {})
-        job_folder = job_info.get(
-            "job_folder",
-            _resolve_run_model_job_folder(job_id, job_info),
-        )
-
-        logs = []
-        if status in ["running", "completed", "failed"]:
-            logs = _tail_job_logs(ssh, job_folder)
-
-        return jsonify(
-            {
-                "job_id": job_id,
-                "bouchet_job_id": bouchet_job_id,
-                "status": status,
-                "submitted_at": job_info.get("submitted_at"),
-                "logs": logs,
-                "resources": row.get("resources"),
-                "aws_cost_estimate": row.get("aws_cost_estimate"),
-                "error": row.get("error"),
-            }
-        )
 
     except Exception as e:
         current_app.logger.error(
