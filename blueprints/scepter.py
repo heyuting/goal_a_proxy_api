@@ -273,7 +273,7 @@ def _slurm_raw_to_status(slurm_status):
 
 # Comparable AWS instance for SCEPTER SLURM jobs (4 CPUs, 16 GB — see #SBATCH in job scripts).
 SCEPTER_SLURM_CPUS_PER_TASK = int(os.getenv("SCEPTER_SLURM_CPUS_PER_TASK", "4"))
-SCEPTER_SLURM_MEM_GB = int(os.getenv("SCEPTER_SLURM_MEM_GB", "16"))
+SCEPTER_SLURM_MEM_GB = int(os.getenv("SCEPTER_SLURM_MEM_GB", "4"))
 SCEPTER_AWS_INSTANCE_TYPE = os.getenv("SCEPTER_AWS_INSTANCE_TYPE", "m6i.xlarge")
 SCEPTER_AWS_REGION = os.getenv("SCEPTER_AWS_REGION", "us-east-1")
 SCEPTER_AWS_ON_DEMAND_USD_PER_HR = float(
@@ -413,7 +413,7 @@ def _build_job_usage_payload(ssh, bouchet_job_id, submitted_at=None):
             "usd": aws_cost,
             "note": (
                 "Estimate using AWS m6i.xlarge on-demand wall-clock time "
-                "(4 vCPU, 16 GiB). Excludes storage and data transfer."
+                f"(4 vCPU, {SCEPTER_SLURM_MEM_GB} GiB). Excludes storage and data transfer."
             ),
         },
     }
@@ -962,7 +962,7 @@ def submit_baseline_simulation():
 #SBATCH --job-name={job_id[:12]}
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --mem={SCEPTER_SLURM_MEM_GB}G
 #SBATCH --time=4:00:00
 #SBATCH --output={job_folder}/%x_%j.out
 #SBATCH --error={job_folder}/%x_%j.err
@@ -1246,7 +1246,7 @@ def submit_baseline_simulation_batch():
 #SBATCH --job-name={cfg["job_id"][:12]}
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --mem={SCEPTER_SLURM_MEM_GB}G
 #SBATCH --time=4:00:00
 #SBATCH --output={cfg["job_folder"]}/%x_%j.out
 #SBATCH --error={cfg["job_folder"]}/%x_%j.err
@@ -1976,7 +1976,7 @@ def submit_run_scepter_model():
 #SBATCH --job-name={job_id[:12]}
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --mem={SCEPTER_SLURM_MEM_GB}G
 #SBATCH --time=4:00:00
 #SBATCH --output={job_folder}/%x_%j.out
 #SBATCH --error={job_folder}/%x_%j.err
@@ -2389,7 +2389,7 @@ def submit_run_scepter_model_batch():
 #SBATCH --job-name={cfg['job_id'][:12]}
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=16G
+#SBATCH --mem={SCEPTER_SLURM_MEM_GB}G
 #SBATCH --time=4:00:00
 #SBATCH --output={job_folder}/%x_%j.out
 #SBATCH --error={job_folder}/%x_%j.err
