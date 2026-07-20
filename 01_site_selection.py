@@ -30,6 +30,16 @@ warnings.filterwarnings("ignore")
 C_S = ["#2166ac", "#4393c3", "#abd9e9", "#fee090", "#fdae61", "#d73027"]
 
 
+def normalize_comid(comid):
+    """Normalize COMID to a plain Python int (avoids '123.0' lookup key mismatches)."""
+    return int(float(comid))
+
+
+def comid_key(comid):
+    """Lookup-table key for COMID dicts."""
+    return str(normalize_comid(comid))
+
+
 def load_lookup_data(filepath):
     """
     Load lookup data file. Tries multiple methods:
@@ -124,7 +134,15 @@ def parse_coordinates(args):
     return coords
 
 
-def run_site_selection(coordinates, script_dir=None, output_dir="output"):
+def _save_gdf_if_nonempty(gdf, path):
+    """Write a GeoDataFrame to shapefile only when it has rows."""
+    if gdf is not None and len(gdf) > 0:
+        gdf.to_file(path)
+
+
+def run_site_selection(
+    coordinates, script_dir=None, output_dir="output", direction="downstream"
+):
     """
     Main function that mirrors the R script logic.
 
@@ -136,7 +154,13 @@ def run_site_selection(coordinates, script_dir=None, output_dir="output"):
         Directory where script is located (for relative paths)
     output_dir : str, optional
         Output directory path
+    direction : str, optional
+        "downstream" (default DRN network) or "upstream" (contributing watershed)
     """
+    direction = (direction or "downstream").lower().strip()
+    if direction not in ("downstream", "upstream"):
+        raise ValueError("direction must be 'downstream' or 'upstream'")
+
     if script_dir is None:
         script_dir = Path(__file__).parent
     else:
@@ -152,17 +176,27 @@ def run_site_selection(coordinates, script_dir=None, output_dir="output"):
     (output_dir / "shp").mkdir(exist_ok=True)
     (output_dir / "figure").mkdir(exist_ok=True)
 
-    print("Loading input data...")
+    print(f"Loading input data (direction={direction})...")
 
     # Read lookup tables (pickle files - converted from RDS)
     input_data_dir = base_dir / "input" / "data"
-    l_up_close_COMID_all = load_lookup_data(input_data_dir / "l_up_close_total.rds")
-    l_down_COMID_all = load_lookup_data(input_data_dir / "l_down_total.rds")
+    if direction == "upstream":
+        l_up_COMID_all = load_lookup_data(input_data_dir / "l_up_total.rds")
+        l_up_close_COMID_all = None
+        l_down_COMID_all = None
+    else:
+        l_up_COMID_all = None
+        l_up_close_COMID_all = load_lookup_data(input_data_dir / "l_up_close_total.rds")
+        l_down_COMID_all = load_lookup_data(input_data_dir / "l_down_total.rds")
 
     # Read spatial data
     input_shp_dir = base_dir / "input" / "shp"
     sf_river_region = gpd.read_file(input_shp_dir / "sf_river_seg_number", quiet=True)
     sf_ws_region = gpd.read_file(input_shp_dir / "sf_basin_us", quiet=True)
+
+    # Normalize COMID columns once for reliable lookups/filters
+    sf_river_region["COMID"] = sf_river_region["COMID"].map(normalize_comid)
+    sf_ws_region["COMID"] = sf_ws_region["COMID"].map(normalize_comid)
 
     # Convert to data table (drop geometry for attribute table)
     dt_river_region = pd.DataFrame(sf_river_region.drop(columns="geometry"))
@@ -190,76 +224,140 @@ def run_site_selection(coordinates, script_dir=None, output_dir="output"):
             "No watersheds found for the given coordinates. Check coordinates are within CONUS."
         )
 
-    s_COMID = sf_ws_point["COMID"].values
+    s_COMID = [normalize_comid(c) for c in sf_ws_point["COMID"].values]
     print(f"Found {len(s_COMID)} matching COMID(s): {s_COMID}")
 
-    # Select river segments that receive EW
-    comid_sel = s_COMID
+    # Select river segments that receive EW / contain click points
+    comid_sel = list(dict.fromkeys(s_COMID))  # unique, preserve order
 
     # Create dt_ws_rock (equivalent to data.table subset)
     dt_ws_rock = dt_river_region[dt_river_region["COMID"].isin(comid_sel)][
         ["COMID", "outlet", "Length", "ws_area"]
     ].copy()
 
-    # Get total number of segments downstream (including itself)
-    # R: num_seg <- as.numeric(sapply(l_down_COMID_all[as.character(dt_ws_rock$COMID)], length))
-    num_seg = [
-        len(l_down_COMID_all.get(str(comid), [])) for comid in dt_ws_rock["COMID"]
-    ]
-    dt_ws_rock["num_seg_downstream"] = num_seg
+    if direction == "upstream":
+        # Full contributing watershed: every catchment that drains to the
+        # clicked point(s), from l_up_total (includes the point's own COMID).
+        # Look up from basin COMIDs at the click — do not depend on river table.
+        v_COMID_all = []
+        for comid in comid_sel:
+            ups = l_up_COMID_all.get(comid_key(comid), [])
+            if ups:
+                v_COMID_all.extend(normalize_comid(c) for c in ups)
+            else:
+                print(
+                    f"Warning: no l_up_total entry for COMID {comid}; "
+                    "using local catchment only"
+                )
+                v_COMID_all.append(normalize_comid(comid))
 
-    # Per outlet, how many segments directly receive EW
-    # R: dt_ws_rock[, num_seg_per_outlet := .N, by = outlet]
-    outlet_counts = (
-        dt_ws_rock.groupby("outlet").size().reset_index(name="num_seg_per_outlet")
-    )
-    dt_ws_rock = dt_ws_rock.merge(outlet_counts, on="outlet", how="left")
+        v_COMID_all = sorted({c for c in v_COMID_all if c != 1})
 
-    # Order by num_seg_per_outlet from small to big
-    dt_ws_rock = dt_ws_rock.sort_values("num_seg_per_outlet").reset_index(drop=True)
+        # Reuse downstream layer names so existing map/API wiring works:
+        # sf_river_ode = all upstream rivers; trib unused for upstream mode
+        v_COMID_ode_unique = list(v_COMID_all)
+        v_COMID_ode_up_unique_tributary = []
 
-    # Get all downstream segments (with current segment included)
-    # R: v_COMID_ode <- unname(unlist(l_down_COMID_all[as.character(dt_ws_rock$COMID)]))
-    v_COMID_ode = []
-    for comid in dt_ws_rock["COMID"]:
-        v_COMID_ode.extend(l_down_COMID_all.get(str(comid), []))
-    v_COMID_ode_unique = list(set(v_COMID_ode))  # unique()
+        if len(dt_ws_rock) == 0:
+            # Still allow upstream viz if river attributes are missing
+            dt_ws_rock = pd.DataFrame(
+                {
+                    "COMID": comid_sel,
+                    "outlet": comid_sel,
+                    "Length": [None] * len(comid_sel),
+                    "ws_area": [None] * len(comid_sel),
+                }
+            )
 
-    # Get closest upstream tributaries
-    # R: v_COMID_ode_up <- unname(unlist(l_up_close_COMID_all[as.character(v_COMID_ode_unique)]))
-    v_COMID_ode_up = []
-    for comid in v_COMID_ode_unique:
-        v_COMID_ode_up.extend(l_up_close_COMID_all.get(str(comid), []))
-    v_COMID_ode_up_unique = list(set(v_COMID_ode_up))
+        dt_ws_rock["num_seg_downstream"] = 0
+        dt_ws_rock["num_seg_upstream"] = [
+            len(l_up_COMID_all.get(comid_key(comid), []))
+            for comid in dt_ws_rock["COMID"]
+        ]
+        outlet_counts = (
+            dt_ws_rock.groupby("outlet").size().reset_index(name="num_seg_per_outlet")
+        )
+        dt_ws_rock = dt_ws_rock.merge(outlet_counts, on="outlet", how="left")
+        dt_ws_rock = dt_ws_rock.sort_values("num_seg_per_outlet").reset_index(drop=True)
 
-    # Remove 1 if present
-    v_COMID_ode_up_unique = [c for c in v_COMID_ode_up_unique if c != 1]
+        print(
+            f"Total upstream COMIDs in contributing watershed: {len(v_COMID_all)} "
+            f"(from click COMID(s) {comid_sel})"
+        )
+    else:
+        if len(dt_ws_rock) == 0:
+            raise ValueError(
+                f"No river segments found for basin COMID(s) {comid_sel}."
+            )
 
-    # Pure tributaries not in direct downstreams
-    v_COMID_ode_up_unique_tributary = [
-        c for c in v_COMID_ode_up_unique if c not in v_COMID_ode_unique
-    ]
+        # Get total number of segments downstream (including itself)
+        # R: num_seg <- as.numeric(sapply(l_down_COMID_all[as.character(dt_ws_rock$COMID)], length))
+        num_seg = [
+            len(l_down_COMID_all.get(comid_key(comid), []))
+            for comid in dt_ws_rock["COMID"]
+        ]
+        dt_ws_rock["num_seg_downstream"] = num_seg
 
-    # Combine direct downstreams and pure tributaries
-    v_COMID_all = v_COMID_ode_unique + v_COMID_ode_up_unique_tributary
+        # Per outlet, how many segments directly receive EW
+        # R: dt_ws_rock[, num_seg_per_outlet := .N, by = outlet]
+        outlet_counts = (
+            dt_ws_rock.groupby("outlet").size().reset_index(name="num_seg_per_outlet")
+        )
+        dt_ws_rock = dt_ws_rock.merge(outlet_counts, on="outlet", how="left")
 
-    print(f"Total COMIDs in network: {len(v_COMID_all)}")
-    print(f"  - Direct downstream: {len(v_COMID_ode_unique)}")
-    print(f"  - Tributaries: {len(v_COMID_ode_up_unique_tributary)}")
+        # Order by num_seg_per_outlet from small to big
+        dt_ws_rock = dt_ws_rock.sort_values("num_seg_per_outlet").reset_index(drop=True)
+
+        # Get all downstream segments (with current segment included)
+        # R: v_COMID_ode <- unname(unlist(l_down_COMID_all[as.character(dt_ws_rock$COMID)]))
+        v_COMID_ode = []
+        for comid in dt_ws_rock["COMID"]:
+            v_COMID_ode.extend(
+                normalize_comid(c)
+                for c in l_down_COMID_all.get(comid_key(comid), [])
+            )
+        v_COMID_ode_unique = list(set(v_COMID_ode))  # unique()
+
+        # Get closest upstream tributaries
+        # R: v_COMID_ode_up <- unname(unlist(l_up_close_COMID_all[as.character(v_COMID_ode_unique)]))
+        v_COMID_ode_up = []
+        for comid in v_COMID_ode_unique:
+            v_COMID_ode_up.extend(
+                normalize_comid(c)
+                for c in l_up_close_COMID_all.get(comid_key(comid), [])
+            )
+        v_COMID_ode_up_unique = list(set(v_COMID_ode_up))
+
+        # Remove 1 if present
+        v_COMID_ode_up_unique = [c for c in v_COMID_ode_up_unique if c != 1]
+
+        # Pure tributaries not in direct downstreams
+        v_COMID_ode_up_unique_tributary = [
+            c for c in v_COMID_ode_up_unique if c not in v_COMID_ode_unique
+        ]
+
+        # Combine direct downstreams and pure tributaries
+        v_COMID_all = v_COMID_ode_unique + v_COMID_ode_up_unique_tributary
+
+        print(f"Total COMIDs in network: {len(v_COMID_all)}")
+        print(f"  - Direct downstream: {len(v_COMID_ode_unique)}")
+        print(f"  - Tributaries: {len(v_COMID_ode_up_unique_tributary)}")
 
     # Get spatial features for this region
-    sf_river_rock = sf_river_region[
-        sf_river_region["COMID"].isin(dt_ws_rock["COMID"])
-    ].copy()
-    sf_river_outlet = sf_river_region[
-        sf_river_region["COMID"].isin(dt_ws_rock["outlet"].unique())
-    ].copy()
-    sf_ws_outlet = sf_ws_region[
-        sf_ws_region["COMID"].isin(dt_ws_rock["outlet"].unique())
-    ].copy()
+    rock_comids = [normalize_comid(c) for c in dt_ws_rock["COMID"]]
+    outlet_comids = [normalize_comid(c) for c in dt_ws_rock["outlet"].unique()]
+
+    sf_river_rock = sf_river_region[sf_river_region["COMID"].isin(rock_comids)].copy()
+    sf_ws_outlet = sf_ws_region[sf_ws_region["COMID"].isin(outlet_comids)].copy()
 
     sf_ws_all = sf_ws_region[sf_ws_region["COMID"].isin(v_COMID_all)].copy()
-    sf_river_all = sf_river_region[sf_river_region["COMID"].isin(v_COMID_all)].copy()
+
+    # For upstream mode, dissolve catchments into one contributing-watershed polygon
+    # so the map shows the full drainage area, not only the clicked local catchment.
+    if direction == "upstream" and len(sf_ws_all) > 0:
+        print(f"Dissolving {len(sf_ws_all)} upstream catchments into one watershed...")
+        sf_ws_all = sf_ws_all.dissolve().reset_index(drop=True)
+        sf_ws_all["COMID"] = comid_sel[0] if len(comid_sel) == 1 else -1
 
     sf_river_ode = sf_river_region[
         sf_river_region["COMID"].isin(v_COMID_ode_unique)
@@ -268,14 +366,10 @@ def run_site_selection(coordinates, script_dir=None, output_dir="output"):
         sf_river_region["COMID"].isin(v_COMID_ode_up_unique_tributary)
     ].copy()
 
-    sf_ws_ode = sf_ws_region[sf_ws_region["COMID"].isin(v_COMID_ode_unique)].copy()
-    sf_ws_trib = sf_ws_region[
-        sf_ws_region["COMID"].isin(v_COMID_ode_up_unique_tributary)
-    ].copy()
-
     # Calculate centroids
     sf_river_middle = sf_river_rock.copy()
-    sf_river_middle["geometry"] = sf_river_rock.centroid
+    if len(sf_river_middle) > 0:
+        sf_river_middle["geometry"] = sf_river_rock.centroid
 
     # Create watershed shapefile for selected points (watersheds that contain each point)
     # sf_ws_point contains the intersection result - extract just the watershed polygons
@@ -293,13 +387,18 @@ def run_site_selection(coordinates, script_dir=None, output_dir="output"):
         point_matches = sf_ws_point[sf_ws_point.index_right == idx]
         if len(point_matches) > 0:
             # Take the first match (or could take largest if multiple)
-            comid = point_matches["COMID"].iloc[0]
+            comid = normalize_comid(point_matches["COMID"].iloc[0])
             point_watershed_map.append(
                 {
                     "point_index": idx,
                     "lon": coordinates[idx][0],
                     "lat": coordinates[idx][1],
-                    "comid": int(comid),
+                    "comid": comid,
+                    "n_upstream": len(
+                        l_up_COMID_all.get(comid_key(comid), [])
+                        if direction == "upstream" and l_up_COMID_all is not None
+                        else []
+                    ),
                 }
             )
 
@@ -318,63 +417,74 @@ def run_site_selection(coordinates, script_dir=None, output_dir="output"):
         pickle.dump(
             v_COMID_ode_up_unique_tributary, f, protocol=pickle.HIGHEST_PROTOCOL
         )
+    with open(output_dir / "data" / "direction.txt", "w") as f:
+        f.write(direction)
 
-    # Save shapefiles
-    sf_ws_all.to_file(output_dir / "shp" / "sf_ws_all.shp")
-    sf_ws_selected.to_file(
-        output_dir / "shp" / "sf_ws_selected.shp"
+    # Save shapefiles (skip empty layers, e.g. trib in upstream mode)
+    _save_gdf_if_nonempty(sf_ws_all, output_dir / "shp" / "sf_ws_all.shp")
+    _save_gdf_if_nonempty(
+        sf_ws_selected, output_dir / "shp" / "sf_ws_selected.shp"
     )  # Watersheds containing selected points
-    sf_river_ode.to_file(output_dir / "shp" / "sf_river_ode.shp")
-    sf_river_trib.to_file(output_dir / "shp" / "sf_river_trib.shp")
-    sf_river_middle.to_file(output_dir / "shp" / "sf_river_middle.shp")
+    _save_gdf_if_nonempty(sf_river_ode, output_dir / "shp" / "sf_river_ode.shp")
+    _save_gdf_if_nonempty(sf_river_trib, output_dir / "shp" / "sf_river_trib.shp")
+    _save_gdf_if_nonempty(sf_river_middle, output_dir / "shp" / "sf_river_middle.shp")
 
     # Save point-watershed mapping as JSON for easy lookup
     with open(output_dir / "data" / "point_watershed_map.json", "w") as f:
         json.dump(point_watershed_map, f, indent=2)
 
     # Create plot
-    print("Creating visualization...")
-    bbox = sf_ws_all.total_bounds
-    asp_ratio = (bbox[3] - bbox[1]) / (bbox[2] - bbox[0])
+    if len(sf_ws_all) > 0:
+        print("Creating visualization...")
+        bbox = sf_ws_all.total_bounds
+        width = bbox[2] - bbox[0]
+        asp_ratio = (bbox[3] - bbox[1]) / width if width > 0 else 1.0
 
-    fig, ax = plt.subplots(figsize=(6, 6 * asp_ratio), dpi=500)
+        fig, ax = plt.subplots(figsize=(6, 6 * asp_ratio), dpi=500)
 
-    # Plot watersheds (background)
-    sf_ws_all.plot(
-        ax=ax, color="#eeeeee", edgecolor="#aaaaaa", linewidth=0.1, alpha=0.5
-    )
+        # Plot watersheds (background)
+        sf_ws_all.plot(
+            ax=ax, color="#eeeeee", edgecolor="#aaaaaa", linewidth=0.1, alpha=0.5
+        )
 
-    # Plot rivers
-    sf_river_ode.plot(ax=ax, color=C_S[5], linewidth=0.2)  # c_s[6] in R (0-indexed)
-    sf_river_trib.plot(ax=ax, color=C_S[4], linewidth=0.15)  # c_s[5]
-    sf_river_rock.plot(ax=ax, color=C_S[0], linewidth=0.2)  # c_s[1]
+        # Plot rivers
+        if len(sf_river_ode) > 0:
+            sf_river_ode.plot(ax=ax, color=C_S[5], linewidth=0.2)
+        if len(sf_river_trib) > 0:
+            sf_river_trib.plot(ax=ax, color=C_S[4], linewidth=0.15)
+        if len(sf_river_rock) > 0:
+            sf_river_rock.plot(ax=ax, color=C_S[0], linewidth=0.2)
 
-    # Plot outlet watershed
-    sf_ws_outlet.plot(ax=ax, color=C_S[5], edgecolor=C_S[5], linewidth=0.1, alpha=0.3)
+        # Plot outlet watershed (downstream mode only)
+        if direction == "downstream" and len(sf_ws_outlet) > 0:
+            sf_ws_outlet.plot(
+                ax=ax, color=C_S[5], edgecolor=C_S[5], linewidth=0.1, alpha=0.3
+            )
 
-    # Plot centroids
-    sf_river_middle.plot(
-        ax=ax,
-        color=C_S[0],
-        edgecolor="#aaaaaa",
-        linewidth=0.1,
-        markersize=1,
-        marker="o",
-    )
+        # Plot centroids
+        if len(sf_river_middle) > 0:
+            sf_river_middle.plot(
+                ax=ax,
+                color=C_S[0],
+                edgecolor="#aaaaaa",
+                linewidth=0.1,
+                markersize=1,
+                marker="o",
+            )
 
-    ax.set_xlim(bbox[0], bbox[2])
-    ax.set_ylim(bbox[1], bbox[3])
-    ax.set_aspect("equal")
-    ax.grid(True, linestyle="--", linewidth=0.3, alpha=0.5)
-    ax.set_xlabel("Longitude", fontsize=10)
-    ax.set_ylabel("Latitude", fontsize=10)
-    ax.tick_params(labelsize=10)
+        ax.set_xlim(bbox[0], bbox[2])
+        ax.set_ylim(bbox[1], bbox[3])
+        ax.set_aspect("equal")
+        ax.grid(True, linestyle="--", linewidth=0.3, alpha=0.5)
+        ax.set_xlabel("Longitude", fontsize=10)
+        ax.set_ylabel("Latitude", fontsize=10)
+        ax.tick_params(labelsize=10)
 
-    plt.tight_layout()
-    plt.savefig(
-        output_dir / "figure" / "map_river_ws.png", dpi=500, bbox_inches="tight"
-    )
-    plt.close()
+        plt.tight_layout()
+        plt.savefig(
+            output_dir / "figure" / "map_river_ws.png", dpi=500, bbox_inches="tight"
+        )
+        plt.close()
 
     print(f"✓ Site selection complete! Outputs saved to {output_dir}")
     return {
@@ -382,6 +492,7 @@ def run_site_selection(coordinates, script_dir=None, output_dir="output"):
         "v_COMID_all": v_COMID_all,
         "v_COMID_ode_unique": v_COMID_ode_unique,
         "v_COMID_ode_up_unique_tributary": v_COMID_ode_up_unique_tributary,
+        "direction": direction,
     }
 
 
@@ -394,8 +505,11 @@ Examples:
   # From JSON file
   python 01_site_selection.py --coords-file coords.json
   
-  # Single point
+  # Single point (downstream network, default)
   python 01_site_selection.py --lat 37 --lon -78
+  
+  # Upstream contributing watershed
+  python 01_site_selection.py --lat 37 --lon -78 --direction upstream
   
   # Multiple points
   python 01_site_selection.py --lat 37 --lon -78 --lat 36.5 --lon -77.5
@@ -425,6 +539,13 @@ Examples:
         default="output",
         help="Output directory (default: output)",
     )
+    parser.add_argument(
+        "--direction",
+        type=str,
+        choices=["downstream", "upstream"],
+        default="downstream",
+        help="Watershed direction: downstream (DRN network) or upstream (contributing area)",
+    )
 
     args = parser.parse_args()
 
@@ -433,10 +554,14 @@ Examples:
         script_dir = Path(args.script_dir) if args.script_dir else Path(__file__).parent
 
         results = run_site_selection(
-            coords, script_dir=script_dir, output_dir=args.output_dir
+            coords,
+            script_dir=script_dir,
+            output_dir=args.output_dir,
+            direction=args.direction,
         )
 
         print("\nSummary:")
+        print(f"  Direction: {results['direction']}")
         print(f"  Selected segments: {len(results['dt_ws_rock'])}")
         print(f"  Total network COMIDs: {len(results['v_COMID_all'])}")
 

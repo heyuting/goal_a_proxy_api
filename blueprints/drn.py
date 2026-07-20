@@ -2005,6 +2005,16 @@ def generate_watershed():
     try:
         payload = request.get_json()
         coordinates = payload.get("coordinates", [])
+        direction = (payload.get("direction") or "downstream").lower().strip()
+        if direction not in ("downstream", "upstream"):
+            return (
+                jsonify(
+                    {
+                        "error": "Invalid direction. Expected 'downstream' or 'upstream'"
+                    }
+                ),
+                400,
+            )
 
         # Validate coordinates
         if not coordinates or not isinstance(coordinates, list) or len(coordinates) < 1:
@@ -2062,7 +2072,7 @@ def generate_watershed():
                 )
 
             current_app.logger.info(
-                f"Generating watersheds using {site_selection_script}"
+                f"Generating {direction} watersheds using {site_selection_script}"
             )
 
             # Determine the DRN models directory (where input data is located)
@@ -2107,6 +2117,19 @@ def generate_watershed():
                     500,
                 )
 
+            if direction == "upstream":
+                up_pkl = os.path.join(drn_models_dir, "input", "data", "l_up_total.pkl")
+                up_rds = os.path.join(drn_models_dir, "input", "data", "l_up_total.rds")
+                if not os.path.exists(up_pkl) and not os.path.exists(up_rds):
+                    return (
+                        jsonify(
+                            {
+                                "error": "Upstream watershed lookup (l_up_total.pkl) not found in DRN input/data."
+                            }
+                        ),
+                        500,
+                    )
+
             # Run 01_site_selection.py locally
             cmd = [
                 "python3",
@@ -2117,13 +2140,15 @@ def generate_watershed():
                 temp_output_dir,
                 "--script-dir",
                 drn_models_dir,
+                "--direction",
+                direction,
             ]
 
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=300,  # 5 minute timeout for watershed generation
+                timeout=600,  # upstream dissolve of large basins can be slow
             )
 
             if result.returncode != 0:
@@ -2190,9 +2215,11 @@ def generate_watershed():
 
             if watershed_results:
                 current_app.logger.info(
-                    f"Successfully generated {len(watershed_results)} watershed layers"
+                    f"Successfully generated {len(watershed_results)} {direction} watershed layers"
                 )
-                return jsonify({"watersheds": watershed_results})
+                return jsonify(
+                    {"watersheds": watershed_results, "direction": direction}
+                )
             else:
                 return (
                     jsonify({"error": "No watershed files found or converted"}),
