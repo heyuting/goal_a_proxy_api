@@ -89,10 +89,11 @@ def add_cors_for_allowed_origin(response):
 
 
 # Register blueprints
-from blueprints import drn_bp, scepter_bp
+from blueprints import drn_bp, scepter_bp, auth_bp
 
 app.register_blueprint(drn_bp)
 app.register_blueprint(scepter_bp)
+app.register_blueprint(auth_bp)
 
 
 @app.route("/api/test-cors", methods=["GET", "POST", "OPTIONS"])
