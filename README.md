@@ -225,18 +225,11 @@ ssh -O check bouchet                  # should succeed while master is up
 | `BOUCHET_USER` / `BOUCHET_HOST` | HPC username / host (also set in `~/.ssh/config`) |
 | `SSH_HOST_ALIAS` | Usually `bouchet` (must match `Host` in ssh config) |
 | `CORS_ORIGINS` | Exact frontend origin (e.g. `http://10.5.203.164` or with `:port`) |
-| `DRN_MODELS_DIR` | Absolute path to DRN `R_code` containing `input/data` + `input/shp` (required for local watershed generation on Spinup) |
+| `DRN_MODELS_DIR` | Optional on Spinup now. Absolute path to DRN `R_code` with `input/data` + `input/shp` if you still run COMID/outlet checks locally |
 
 You do **not** need `SSH_PRIVATE_KEY` / `SSH_PRIVATE_KEY_PATH` in `.env` anymore — OpenSSH reads the key from `IdentityFile` in `~/.ssh/config`.
 
-Watershed generation (`POST /api/drn/generate-watershed`) runs **on the API VM**, not via SSH. Put the DRN lookup tables on Spinup, for example:
-
-```bash
-# from a machine that has the full Models/DRN/R_code tree
-rsync -aP Models/DRN/R_code/ yhs5@<spinup-api-host>:~/webapp/DRN/R_code/
-# then in .env on Spinup:
-# DRN_MODELS_DIR=/home/yhs5/webapp/DRN/R_code
-```
+Watershed generation (`POST /api/drn/generate-watershed`) runs on **Bouchet** (16–32G SLURM job). The API returns a `job_id`; the frontend polls `/api/drn/watershed/<job_id>/status` and fetches GeoJSON from `/results`. Keep ControlMaster up (`./ssh_login_bouchet.sh`). National DRN inputs stay on Bouchet under `~/project_pi_par35/yhs5/DRN/R_code` — you do **not** need a 16G Spinup VM for watersheds.
 
 ### 3. Point the frontend at the API
 
