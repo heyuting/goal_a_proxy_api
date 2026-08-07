@@ -46,11 +46,6 @@ SSH_CONTROL_PATH = os.path.expanduser(
 SSH_CONTROL_PERSIST = os.getenv("SSH_CONTROL_PERSIST", "yes")
 SSH_CONNECT_TIMEOUT_SEC = int(os.getenv("SSH_CONNECT_TIMEOUT_SEC", "30"))
 
-# Kept for env-check compatibility; OpenSSH owns the key, not this process.
-MFA_RESPONSE_TIMEOUT_SEC = int(os.getenv("MFA_RESPONSE_TIMEOUT_SEC", "150"))
-SSH_BANNER_TIMEOUT_SEC = int(os.getenv("SSH_BANNER_TIMEOUT_SEC", "60"))
-SSH_AUTH_TIMEOUT_SEC = int(os.getenv("SSH_AUTH_TIMEOUT_SEC", "180"))
-
 # Shared lab account: end users should not see operator SSH/Duo instructions.
 HPC_UNAVAILABLE_USER_MSG = (
     "Yale HPC is currently unavailable. Please try again later, or contact "
