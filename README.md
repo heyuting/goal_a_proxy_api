@@ -207,7 +207,7 @@ Browser → Frontend (Spinup) → Proxy API (Spinup) → OpenSSH (ssh bouchet �
                          (Duo + private key stay in OpenSSH)
 ```
 
-Spinup VMs are on the Yale network, so the API can reach `bouchet.ycrc.yale.edu`. Duo is completed once in a terminal on the API host; ControlPersist keeps the multiplexed socket for later API calls.
+Spinup VMs are on the Yale network, so the API can reach `bouchet.ycrc.yale.edu`. Duo is completed once in a terminal on the API host; `ControlPersist yes` keeps the multiplexed socket until reboot, `ssh -O exit bouchet`, or Bouchet drops the connection (not a fixed 8-hour timeout).
 
 ### 1. OpenSSH on the API VM
 

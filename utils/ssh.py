@@ -42,7 +42,8 @@ SSH_HOST_ALIAS = os.getenv("SSH_HOST_ALIAS", "bouchet")
 SSH_CONTROL_PATH = os.path.expanduser(
     os.getenv("SSH_CONTROL_PATH", "~/.ssh/cm-bouchet-%r@%h:%p")
 )
-SSH_CONTROL_PERSIST = os.getenv("SSH_CONTROL_PERSIST", "8h")
+# "yes" = keep ControlMaster until killed/reboot (not a timed 8h expiry).
+SSH_CONTROL_PERSIST = os.getenv("SSH_CONTROL_PERSIST", "yes")
 SSH_CONNECT_TIMEOUT_SEC = int(os.getenv("SSH_CONNECT_TIMEOUT_SEC", "30"))
 
 # Kept for env-check compatibility; OpenSSH owns the key, not this process.

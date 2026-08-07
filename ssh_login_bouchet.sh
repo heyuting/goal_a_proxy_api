@@ -7,7 +7,7 @@ HOST_ALIAS="${SSH_HOST_ALIAS:-bouchet}"
 FQDN="${BOUCHET_HOST:-bouchet.ycrc.yale.edu}"
 USER_NAME="${BOUCHET_USER:-yhs5}"
 CONTROL_PATH="${SSH_CONTROL_PATH:-$HOME/.ssh/cm-bouchet-%r@%h:%p}"
-CONTROL_PERSIST="${SSH_CONTROL_PERSIST:-8h}"
+CONTROL_PERSIST="${SSH_CONTROL_PERSIST:-yes}"
 IDENTITY_FILE="${SSH_IDENTITY_FILE:-$HOME/.ssh/id_ed25519}"
 
 mkdir -p "$HOME/.ssh"
@@ -40,7 +40,7 @@ if [[ "${has_alias}" -eq 0 ]]; then
 fi
 
 echo "Opening OpenSSH ControlMaster to '${TARGET}'..."
-echo "Complete Duo in this terminal. ControlPersist keeps the session after you exit."
+echo "Complete Duo in this terminal. ControlPersist=${CONTROL_PERSIST} keeps the master after you exit."
 echo "ControlPath: ${CONTROL_PATH}"
 echo
 

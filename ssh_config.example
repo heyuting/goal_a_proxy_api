@@ -10,6 +10,7 @@ Host bouchet
   IdentitiesOnly yes
   ControlMaster auto
   ControlPath ~/.ssh/cm-bouchet-%r@%h:%p
-  ControlPersist 8h
+  # Keep ControlMaster until reboot / ssh -O exit / server drop (not a timed expiry).
+  ControlPersist yes
   ServerAliveInterval 30
   ServerAliveCountMax 3
