@@ -53,8 +53,8 @@ SSH_AUTH_TIMEOUT_SEC = int(os.getenv("SSH_AUTH_TIMEOUT_SEC", "180"))
 
 # Shared lab account: end users should not see operator SSH/Duo instructions.
 HPC_UNAVAILABLE_USER_MSG = (
-    "Yale HPC is temporarily unavailable. Please try again later. "
-    "If this persists, contact the site administrator."
+    "Yale HPC is currently unavailable. Please try again later, or contact "
+    "yuting.smeglin@yale.edu if the problem continues."
 )
 
 
