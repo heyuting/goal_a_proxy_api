@@ -3246,7 +3246,7 @@ def download_full_pipeline_results(job_id):
             remote_file.close()
             sftp.close()
             # Don't close pooled connection - keep it for reuse
-        except paramiko.SSHException as ssh_err:
+        except Exception as ssh_err:
             error_msg = str(ssh_err)
             current_app.logger.error(
                 f"SSH error during download for {job_id}: {error_msg}"

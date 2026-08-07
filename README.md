@@ -1,11 +1,13 @@
 # Goal A Proxy API
 
-A Flask-based proxy API that submits DRN / SCEPTER jobs to Yale Bouchet HPC via SSH (with Duo MFA bridged to the browser) and provides job status monitoring.
+A Flask-based proxy API that submits DRN / SCEPTER jobs to Yale Bouchet HPC via the system **OpenSSH** client and provides job status monitoring.
+
+Python never loads your private key. OpenSSH reads `~/.ssh/*`, verifies `known_hosts`, runs the protocol, and handles Duo keyboard-interactive auth. The API only runs commands like `ssh bouchet 'sbatch ...'`.
 
 ## Features
 
-- Submit DRN / SCEPTER jobs to Bouchet via SSH
-- Duo MFA prompts surfaced to the web UI (`/api/auth/mfa-*`)
+- Submit DRN / SCEPTER jobs to Bouchet via OpenSSH subprocess
+- Duo via OpenSSH ControlMaster (authenticate once on the API host)
 - Real-time job status monitoring using SLURM
 - CORS-enabled for Spinup / local frontend integration
 - Comprehensive error handling and logging
@@ -172,98 +174,91 @@ cd goal_a_proxy_api
 pip install -r requirements.txt
 ```
 
-3. Set up environment variables:
+3. Configure OpenSSH (not Python) for Bouchet:
 
 ```bash
+cp ssh_config.example ~/.ssh/config
+# edit User / IdentityFile
+chmod 600 ~/.ssh/config ~/.ssh/id_ed25519
 cp .env.example .env
-# edit .env for your Spinup IPs / key path
+# edit CORS_ORIGINS for your frontend
 chmod 600 .env
-chmod 600 ~/.ssh/id_ed25519   # or whichever key path you set
 ```
 
-Auth MFA routes used by the frontend:
+4. Authenticate once (Duo in this terminal):
 
-- `GET  /api/auth/mfa-status`
-- `POST /api/auth/mfa-response`
+```bash
+./ssh_login_bouchet.sh
+```
+
+Status endpoint used by the frontend:
+
+- `GET  /api/auth/mfa-status` — reports whether the OpenSSH ControlMaster is alive
+- `POST /api/auth/mfa-response` — not used for Duo with OpenSSH (complete Duo via `ssh_login_bouchet.sh`)
 
 ## Deployment on Yale Spinup (primary)
 
 ### Architecture
 
 ```
-Browser  →  Frontend (Spinup)  →  Proxy API (Spinup)  →  SSH + Duo  →  Bouchet HPC
-                              ↘  /api/auth/mfa-*  ↗
+Browser → Frontend (Spinup) → Proxy API (Spinup) → OpenSSH (ssh bouchet …) → Bouchet
+                                      ↑
+                         ControlMaster from ./ssh_login_bouchet.sh
+                         (Duo + private key stay in OpenSSH)
 ```
 
-Spinup VMs are on the Yale network, so the API can SSH to `bouchet.ycrc.yale.edu` without a personal VPN. Duo still applies; the MFA bridge keeps one SSH session in **process memory**.
+Spinup VMs are on the Yale network, so the API can reach `bouchet.ycrc.yale.edu`. Duo is completed once in a terminal on the API host; ControlPersist keeps the multiplexed socket for later API calls.
 
-### 1. Configure `.env` on the API VM
+### 1. OpenSSH on the API VM
 
-Use `.env.example` as a template. Critical values:
+```bash
+cp ssh_config.example ~/.ssh/config   # Host bouchet …
+chmod 600 ~/.ssh/config ~/.ssh/id_ed25519
+./ssh_login_bouchet.sh                # complete Duo once
+ssh -O check bouchet                  # should succeed while master is up
+```
+
+### 2. Configure `.env` on the API VM
 
 | Variable | Spinup guidance |
 | --- | --- |
-| `BOUCHET_USER` / `BOUCHET_HOST` | Your HPC username and `bouchet.ycrc.yale.edu` |
-| `SSH_PRIVATE_KEY_PATH` | Absolute path to your Yale HPC key **on the Spinup VM** (e.g. `/home/yhs5/.ssh/id_ed25519`) |
-| `CORS_ORIGINS` | Exact frontend origin the browser uses (e.g. `http://10.5.203.164` or `http://10.5.203.164:5173`) |
-| `MFA_RESPONSE_TIMEOUT_SEC` | How long SSH auth waits for the browser Duo choice (default `150`) |
+| `BOUCHET_USER` / `BOUCHET_HOST` | HPC username / host (also set in `~/.ssh/config`) |
+| `SSH_HOST_ALIAS` | Usually `bouchet` (must match `Host` in ssh config) |
+| `CORS_ORIGINS` | Exact frontend origin (e.g. `http://10.5.203.164` or with `:port`) |
 
-Legacy `GRACE_USER` / `GRACE_HOST` still work as fallbacks if `BOUCHET_*` is unset.
+You do **not** need `SSH_PRIVATE_KEY` / `SSH_PRIVATE_KEY_PATH` in `.env` anymore — OpenSSH reads the key from `IdentityFile` in `~/.ssh/config`.
 
-```bash
-chmod 600 .env
-chmod 600 /home/yhs5/.ssh/id_ed25519
-```
-
-### 2. Point the frontend at the API
-
-Set the frontend API base URL to the Spinup API host, for example:
+### 3. Point the frontend at the API
 
 ```text
 http://<api-spinup-ip>:8000
 ```
 
-Include that same frontend origin in `CORS_ORIGINS` on the API.
+Include that frontend origin in `CORS_ORIGINS`.
 
-### 3. Start the API (single worker + threads)
-
-**Required:** one gunicorn worker with multiple threads. MFA status/response must hit the same process that is waiting inside SSH auth.
+### 4. Start the API
 
 ```bash
 ./start_api.sh
-# equivalent:
 # gunicorn --workers 1 --threads 4 --bind 0.0.0.0:8000 --timeout 300 app:app
 ```
 
-- Bind `0.0.0.0` so other Spinup hosts / browsers can reach the API.
-- Do **not** use `--workers 2+`.
-- Keep `--timeout` high enough for Duo (e.g. `300`).
+Single worker is still recommended for simplicity; SSH state now lives in OpenSSH’s ControlMaster socket (shared across processes), not Paramiko memory.
 
-### 4. Smoke checks
+### 5. Smoke checks
 
 ```bash
 curl -s http://127.0.0.1:8000/api/auth/mfa-status
-curl -s -X POST http://127.0.0.1:8000/api/test-cors \
-  -H "Origin: http://10.5.203.164" -H "Content-Type: application/json"
+# expect "status": "authenticated" when ControlMaster is up
 ```
 
-Then trigger a job from the UI and complete Duo in the MFA modal.
+If status is `mfa_required`, re-run `./ssh_login_bouchet.sh` on the API host.
 
 ## Local development (laptop)
 
 ```bash
+./ssh_login_bouchet.sh
 gunicorn --workers 1 --threads 4 --bind 127.0.0.1:8000 --timeout 300 app:app
-# or: python app.py
 ```
 
-Use `CORS_ORIGINS=http://localhost:5173` and a local `SSH_PRIVATE_KEY_PATH`.
-
-### Optional: ngrok tunnel
-
-Only needed if a remote frontend must reach a laptop-hosted API:
-
-```bash
-ngrok http http://localhost:8000
-```
-
-Add the ngrok HTTPS origin to `CORS_ORIGINS` and point the frontend at the ngrok URL.
+Use `CORS_ORIGINS=http://localhost:5173`.

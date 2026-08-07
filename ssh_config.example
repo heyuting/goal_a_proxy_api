@@ -1,0 +1,15 @@
+# Add to ~/.ssh/config on the Spinup API host (chmod 600 ~/.ssh/config).
+#
+# OpenSSH owns the private key and Duo keyboard-interactive auth.
+# The Flask app only runs: ssh bouchet '<command>'
+
+Host bouchet
+  HostName bouchet.ycrc.yale.edu
+  User yhs5
+  IdentityFile ~/.ssh/id_ed25519
+  IdentitiesOnly yes
+  ControlMaster auto
+  ControlPath ~/.ssh/cm-bouchet-%r@%h:%p
+  ControlPersist 8h
+  ServerAliveInterval 30
+  ServerAliveCountMax 3

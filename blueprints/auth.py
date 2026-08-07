@@ -1,4 +1,4 @@
-"""Auth / Duo MFA bridge endpoints for the web UI."""
+"""Auth status endpoints for OpenSSH ControlMaster (Duo on the API host)."""
 from flask import Blueprint, jsonify, request
 
 from utils.ssh import mfa_bridge
@@ -15,6 +15,10 @@ def mfa_status():
 
 @auth_bp.route("/api/auth/mfa-response", methods=["POST", "OPTIONS"])
 def mfa_response():
+    """
+    Kept for frontend compatibility. Duo is completed via OpenSSH on the API
+    host (./ssh_login_bouchet.sh), not by posting a passcode here.
+    """
     if request.method == "OPTIONS":
         return "", 200
 
@@ -31,6 +35,6 @@ def mfa_response():
             "ok": True,
             **mfa_bridge.snapshot(),
             "status": "accepted",
-            "message": "MFA response submitted",
+            "message": "OpenSSH ControlMaster is already authenticated",
         }
     )

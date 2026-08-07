@@ -6,7 +6,6 @@ import io
 import os
 import json
 import time
-import paramiko
 import re
 import logging
 import threading
@@ -16,8 +15,6 @@ load_dotenv()  # Load variables from .env file
 app = Flask(__name__)
 logging.basicConfig(level=logging.DEBUG)
 
-# Suppress paramiko DEBUG messages about dead connections (they're usually harmless)
-logging.getLogger("paramiko.transport").setLevel(logging.WARNING)
 # Configure CORS origins from environment variable or use defaults
 # Read CORS origins from env and strip whitespace/trailing slashes
 cors_origins_env = os.getenv(
