@@ -3201,7 +3201,10 @@ def download_full_pipeline_results(job_id):
             pdf_count = stdout_pdf.read().decode().strip()
 
             # Verify PDFs are in the zip file
-            verify_zip_cmd = f"cd {job_folder} && unzip -l results.zip 2>/dev/null | grep -c '\.pdf$' || echo '0'"
+            verify_zip_cmd = (
+                f"cd {job_folder} && unzip -l results.zip 2>/dev/null | "
+                r"grep -c '\.pdf$' || echo '0'"
+            )
             stdin_verify, stdout_verify, stderr_verify = ssh.exec_command(
                 verify_zip_cmd
             )
