@@ -405,6 +405,20 @@ def run_site_selection(
     # Save outputs
     print("Saving outputs...")
 
+    # Count catchments before any dissolve (upstream dissolves sf_ws_all to 1 polygon)
+    n_total = len(v_COMID_all)
+    n_downstream = len(v_COMID_ode_unique)
+    n_tributaries = len(v_COMID_ode_up_unique_tributary)
+    # Primary count for the active direction's area
+    n_watersheds = n_total if direction == "upstream" else n_downstream
+    watershed_summary = {
+        "direction": direction,
+        "n_watersheds": n_watersheds,
+        "n_downstream": n_downstream,
+        "n_tributaries": n_tributaries,
+        "n_total": n_total,
+    }
+
     # Save CSV
     dt_ws_rock.to_csv(output_dir / "data" / "dt_seg.csv", index=False)
 
@@ -419,6 +433,8 @@ def run_site_selection(
         )
     with open(output_dir / "data" / "direction.txt", "w") as f:
         f.write(direction)
+    with open(output_dir / "data" / "watershed_summary.json", "w") as f:
+        json.dump(watershed_summary, f, indent=2)
 
     # Save shapefiles (skip empty layers, e.g. trib in upstream mode)
     _save_gdf_if_nonempty(sf_ws_all, output_dir / "shp" / "sf_ws_all.shp")
@@ -493,6 +509,8 @@ def run_site_selection(
         "v_COMID_ode_unique": v_COMID_ode_unique,
         "v_COMID_ode_up_unique_tributary": v_COMID_ode_up_unique_tributary,
         "direction": direction,
+        "n_watersheds": n_watersheds,
+        "watershed_summary": watershed_summary,
     }
 
 
@@ -562,6 +580,7 @@ Examples:
 
         print("\nSummary:")
         print(f"  Direction: {results['direction']}")
+        print(f"  Watershed count: {results['n_watersheds']}")
         print(f"  Selected segments: {len(results['dt_ws_rock'])}")
         print(f"  Total network COMIDs: {len(results['v_COMID_all'])}")
 

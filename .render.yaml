@@ -5,4 +5,5 @@ services:
     env: python
     plan: free
     buildCommand: pip install -r requirements.txt
-    startCommand: python app.py
+    # Single worker + threads required: MFA bridge / SSH pool are in-process memory.
+    startCommand: gunicorn --workers 1 --threads 4 --bind 0.0.0.0:$PORT --timeout 300 app:app

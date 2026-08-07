@@ -11,10 +11,22 @@ import paramiko
 
 logger = logging.getLogger(__name__)
 
-BOUCHET_USER = os.getenv("BOUCHET_USER", "yhs5")
+def _bouchet_host():
+    """Prefer BOUCHET_*; fall back to legacy GRACE_* names."""
+    return os.getenv("BOUCHET_HOST") or os.getenv("GRACE_HOST")
+
+
+def _bouchet_user():
+    """Prefer BOUCHET_*; fall back to legacy GRACE_* names."""
+    return os.getenv("BOUCHET_USER") or os.getenv("GRACE_USER") or "yhs5"
+
+
+BOUCHET_USER = _bouchet_user()
 
 # One shared Bouchet SSH session per API process (avoids repeated Duo prompts).
 # Access is serialized with a lock because SSHClient is not thread-safe.
+# IMPORTANT: run a single worker process (e.g. gunicorn --workers 1 --threads 4);
+# MFA state and the pooled connection live in process memory.
 _ssh_pool_conn = None
 _ssh_pool_last_used = None
 _ssh_pool_lock = threading.RLock()
@@ -23,6 +35,25 @@ _ssh_pool_lock = threading.RLock()
 MFA_RESPONSE_TIMEOUT_SEC = int(os.getenv("MFA_RESPONSE_TIMEOUT_SEC", "150"))
 SSH_BANNER_TIMEOUT_SEC = int(os.getenv("SSH_BANNER_TIMEOUT_SEC", "60"))
 SSH_AUTH_TIMEOUT_SEC = int(os.getenv("SSH_AUTH_TIMEOUT_SEC", "180"))
+
+
+def ssh_credentials_configured():
+    """True if host, user, and some private-key source are set."""
+    has_key = bool(
+        os.getenv("SSH_PRIVATE_KEY_PATH")
+        or os.getenv("SSH_PRIVATE_KEY_FILE")
+        or os.getenv("SSH_PRIVATE_KEY")
+    )
+    return bool(_bouchet_host() and _bouchet_user() and has_key)
+
+
+def require_ssh_credentials():
+    if ssh_credentials_configured():
+        return
+    raise Exception(
+        "Set BOUCHET_HOST (or GRACE_HOST), BOUCHET_USER (or GRACE_USER), "
+        "and SSH_PRIVATE_KEY_PATH or SSH_PRIVATE_KEY"
+    )
 
 
 class MfaBridge:
@@ -261,13 +292,17 @@ def _web_ui_duo_interactive():
 
 def get_ssh_connection():
     """Create a new SSH connection to Bouchet (may trigger Duo via the web UI)."""
-    hostname = os.getenv("BOUCHET_HOST")
-    username = os.getenv("BOUCHET_USER")
+    hostname = _bouchet_host()
+    username = _bouchet_user()
 
     if not hostname:
-        raise Exception("BOUCHET_HOST environment variable not set")
+        raise Exception(
+            "BOUCHET_HOST (or legacy GRACE_HOST) environment variable not set"
+        )
     if not username:
-        raise Exception("BOUCHET_USER environment variable not set")
+        raise Exception(
+            "BOUCHET_USER (or legacy GRACE_USER) environment variable not set"
+        )
 
     private_key, key_source = _load_private_key()
     logger.info(

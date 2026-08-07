@@ -11,7 +11,12 @@ import time
 import re
 import threading
 
-from utils.ssh import get_ssh_connection, get_ssh_connection_pooled, BOUCHET_USER
+from utils.ssh import (
+    get_ssh_connection,
+    get_ssh_connection_pooled,
+    BOUCHET_USER,
+    require_ssh_credentials,
+)
 
 drn_bp = Blueprint("drn", __name__)
 JOB_STATUS_CACHE = {}  # In production, use Redis or database
@@ -458,13 +463,7 @@ def submit_full_drn_pipeline():
             return response, 200
 
     try:
-        # Validate environment variables
-        if not os.getenv("BOUCHET_HOST"):
-            raise Exception("BOUCHET_HOST environment variable not set")
-        if not os.getenv("BOUCHET_USER"):
-            raise Exception("BOUCHET_USER environment variable not set")
-        if not os.getenv("SSH_PRIVATE_KEY"):
-            raise Exception("SSH_PRIVATE_KEY environment variable not set")
+        require_ssh_credentials()
 
         payload = request.get_json(silent=True) or {}
         current_app.logger.debug(f"Full pipeline request payload: {payload}")
@@ -2161,7 +2160,25 @@ def generate_watershed():
 
             # Read generated shapefiles and convert to GeoJSON
             watershed_results = {}
+            watershed_summary = {
+                "direction": direction,
+                "n_watersheds": None,
+                "n_downstream": None,
+                "n_tributaries": None,
+                "n_total": None,
+            }
             shp_dir = os.path.join(temp_output_dir, "shp")
+            summary_path = os.path.join(
+                temp_output_dir, "data", "watershed_summary.json"
+            )
+            if os.path.exists(summary_path):
+                try:
+                    with open(summary_path, "r") as f:
+                        watershed_summary = json.load(f)
+                except Exception as e:
+                    current_app.logger.warning(
+                        f"Failed to read watershed_summary.json: {str(e)}"
+                    )
 
             if os.path.exists(shp_dir):
                 shapefiles = {
@@ -2215,10 +2232,16 @@ def generate_watershed():
 
             if watershed_results:
                 current_app.logger.info(
-                    f"Successfully generated {len(watershed_results)} {direction} watershed layers"
+                    f"Successfully generated {len(watershed_results)} {direction} watershed layers "
+                    f"(n_watersheds={watershed_summary.get('n_watersheds')})"
                 )
                 return jsonify(
-                    {"watersheds": watershed_results, "direction": direction}
+                    {
+                        "watersheds": watershed_results,
+                        "direction": direction,
+                        "n_watersheds": watershed_summary.get("n_watersheds"),
+                        "watershed_summary": watershed_summary,
+                    }
                 )
             else:
                 return (

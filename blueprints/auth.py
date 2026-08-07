@@ -22,8 +22,15 @@ def mfa_response():
     choice = data.get("choice", data.get("response", ""))
     auth_id = data.get("auth_id")
 
-    ok, error = mfa_bridge.submit_response(choice, auth_id=auth_id)
+    ok, error = mfa_bridge.submit_response(response=choice, auth_id=auth_id)
     if not ok:
         return jsonify({"ok": False, "error": error, **mfa_bridge.snapshot()}), 409
 
-    return jsonify({"ok": True, **mfa_bridge.snapshot()})
+    return jsonify(
+        {
+            "ok": True,
+            **mfa_bridge.snapshot(),
+            "status": "accepted",
+            "message": "MFA response submitted",
+        }
+    )

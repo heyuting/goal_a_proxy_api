@@ -18,6 +18,7 @@ from utils.ssh import (
     reset_ssh_connection_pool,
     ssh_exec_read,
     BOUCHET_USER,
+    require_ssh_credentials,
 )
 
 scepter_bp = Blueprint("scepter", __name__)
@@ -882,14 +883,7 @@ def submit_baseline_simulation():
         return response, 200
 
     try:
-        if (
-            not os.getenv("BOUCHET_HOST")
-            or not os.getenv("BOUCHET_USER")
-            or not os.getenv("SSH_PRIVATE_KEY")
-        ):
-            raise Exception(
-                "BOUCHET_HOST, BOUCHET_USER, and SSH_PRIVATE_KEY must be set"
-            )
+        require_ssh_credentials()
 
         payload = request.get_json(silent=True) or {}
         coordinate = payload.get("coordinate") or payload.get("coordinates")
@@ -1117,14 +1111,7 @@ def submit_baseline_simulation_batch():
         return response, 200
 
     try:
-        if (
-            not os.getenv("BOUCHET_HOST")
-            or not os.getenv("BOUCHET_USER")
-            or not os.getenv("SSH_PRIVATE_KEY")
-        ):
-            raise Exception(
-                "BOUCHET_HOST, BOUCHET_USER, and SSH_PRIVATE_KEY must be set"
-            )
+        require_ssh_credentials()
 
         payload = request.get_json(silent=True) or {}
         coordinates = payload.get("coordinates") or payload.get("locations")
@@ -1843,14 +1830,7 @@ def submit_run_scepter_model():
         return response, 200
 
     try:
-        if (
-            not os.getenv("BOUCHET_HOST")
-            or not os.getenv("BOUCHET_USER")
-            or not os.getenv("SSH_PRIVATE_KEY")
-        ):
-            raise Exception(
-                "BOUCHET_HOST, BOUCHET_USER, and SSH_PRIVATE_KEY must be set"
-            )
+        require_ssh_credentials()
 
         payload = request.get_json(silent=True) or {}
         spinup_name = payload.get("spinup_name") or payload.get("spinupName")
@@ -2152,14 +2132,7 @@ def submit_run_scepter_model_batch():
         return response, 200
 
     try:
-        if (
-            not os.getenv("BOUCHET_HOST")
-            or not os.getenv("BOUCHET_USER")
-            or not os.getenv("SSH_PRIVATE_KEY")
-        ):
-            raise Exception(
-                "BOUCHET_HOST, BOUCHET_USER, and SSH_PRIVATE_KEY must be set"
-            )
+        require_ssh_credentials()
 
         payload = request.get_json(silent=True) or {}
         locations = (

@@ -1,13 +1,13 @@
 # Goal A Proxy API
 
-A Flask-based proxy API that submits DRN jobs to Grace HPC cluster via SSH and provides job status monitoring capabilities.
+A Flask-based proxy API that submits DRN / SCEPTER jobs to Yale Bouchet HPC via SSH (with Duo MFA bridged to the browser) and provides job status monitoring.
 
 ## Features
 
-- Submit DRN model jobs to Grace HPC cluster via SSH
-- Real-time job status monitoring using SLURM queue system
-- Support for multiple payload formats (legacy and new data structures)
-- CORS-enabled for web frontend integration
+- Submit DRN / SCEPTER jobs to Bouchet via SSH
+- Duo MFA prompts surfaced to the web UI (`/api/auth/mfa-*`)
+- Real-time job status monitoring using SLURM
+- CORS-enabled for Spinup / local frontend integration
 - Comprehensive error handling and logging
 
 ## API Endpoints
@@ -172,60 +172,98 @@ cd goal_a_proxy_api
 pip install -r requirements.txt
 ```
 
-3. Set up environment variables (create a `.env` file):
-
-```env
-GRACE_USER=your_username
-GRACE_HOST=grace.ycrc.yale.edu
-SSH_PRIVATE_KEY="-----BEGIN OPENSSH PRIVATE KEY-----\n...\n-----END OPENSSH PRIVATE KEY-----"
-CORS_ORIGINS=http://localhost:5173,https://your-frontend-domain.com
-```
-
-## Local Development
-
-Run the Flask development server:
+3. Set up environment variables:
 
 ```bash
-python app.py
+cp .env.example .env
+# edit .env for your Spinup IPs / key path
+chmod 600 .env
+chmod 600 ~/.ssh/id_ed25519   # or whichever key path you set
 ```
 
-The API will be available at `http://localhost:8000`
+Auth MFA routes used by the frontend:
 
-## Deployment
+- `GET  /api/auth/mfa-status`
+- `POST /api/auth/mfa-response`
 
-### Architecture Overview
+## Deployment on Yale Spinup (primary)
 
-Since cloud services cannot directly access Grace HPC (requires VPN), this setup uses a **local deployment with tunneling**:
+### Architecture
 
-1. **Local Machine** - Hosts the Flask API and connects to Grace via VPN
-2. **ngrok** - Creates secure tunnel to expose local API to the internet
-3. **Grace HPC** - Target cluster for job execution
+```
+Browser  →  Frontend (Spinup)  →  Proxy API (Spinup)  →  SSH + Duo  →  Bouchet HPC
+                              ↘  /api/auth/mfa-*  ↗
+```
 
-### Setup Instructions
+Spinup VMs are on the Yale network, so the API can SSH to `bouchet.ycrc.yale.edu` without a personal VPN. Duo still applies; the MFA bridge keeps one SSH session in **process memory**.
 
-#### Local Deployment with ngrok
+### 1. Configure `.env` on the API VM
 
-On your local machine that has VPN access to Grace:
+Use `.env.example` as a template. Critical values:
 
-1. Install ngrok:
+| Variable | Spinup guidance |
+| --- | --- |
+| `BOUCHET_USER` / `BOUCHET_HOST` | Your HPC username and `bouchet.ycrc.yale.edu` |
+| `SSH_PRIVATE_KEY_PATH` | Absolute path to your Yale HPC key **on the Spinup VM** (e.g. `/home/yhs5/.ssh/id_ed25519`) |
+| `CORS_ORIGINS` | Exact frontend origin the browser uses (e.g. `http://10.5.203.164` or `http://10.5.203.164:5173`) |
+| `MFA_RESPONSE_TIMEOUT_SEC` | How long SSH auth waits for the browser Duo choice (default `150`) |
+
+Legacy `GRACE_USER` / `GRACE_HOST` still work as fallbacks if `BOUCHET_*` is unset.
 
 ```bash
-# Download and install ngrok
-# Visit https://ngrok.com/download
+chmod 600 .env
+chmod 600 /home/yhs5/.ssh/id_ed25519
 ```
 
-2. Set up environment variables (create a `.env` file)
+### 2. Point the frontend at the API
 
-3. Run the Flask app locally:
+Set the frontend API base URL to the Spinup API host, for example:
+
+```text
+http://<api-spinup-ip>:8000
+```
+
+Include that same frontend origin in `CORS_ORIGINS` on the API.
+
+### 3. Start the API (single worker + threads)
+
+**Required:** one gunicorn worker with multiple threads. MFA status/response must hit the same process that is waiting inside SSH auth.
 
 ```bash
-python app.py
+./start_api.sh
+# equivalent:
+# gunicorn --workers 1 --threads 4 --bind 0.0.0.0:8000 --timeout 300 app:app
 ```
 
-4. Create ngrok tunnel:
+- Bind `0.0.0.0` so other Spinup hosts / browsers can reach the API.
+- Do **not** use `--workers 2+`.
+- Keep `--timeout` high enough for Duo (e.g. `300`).
+
+### 4. Smoke checks
+
+```bash
+curl -s http://127.0.0.1:8000/api/auth/mfa-status
+curl -s -X POST http://127.0.0.1:8000/api/test-cors \
+  -H "Origin: http://10.5.203.164" -H "Content-Type: application/json"
+```
+
+Then trigger a job from the UI and complete Duo in the MFA modal.
+
+## Local development (laptop)
+
+```bash
+gunicorn --workers 1 --threads 4 --bind 127.0.0.1:8000 --timeout 300 app:app
+# or: python app.py
+```
+
+Use `CORS_ORIGINS=http://localhost:5173` and a local `SSH_PRIVATE_KEY_PATH`.
+
+### Optional: ngrok tunnel
+
+Only needed if a remote frontend must reach a laptop-hosted API:
 
 ```bash
 ngrok http http://localhost:8000
 ```
 
-5. Note the ngrok URL (e.g., `https://abc123.ngrok.io`) and use this as your API endpoint
+Add the ngrok HTTPS origin to `CORS_ORIGINS` and point the frontend at the ngrok URL.
