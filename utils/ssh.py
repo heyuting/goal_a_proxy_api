@@ -161,12 +161,16 @@ class MfaBridge:
             if alive:
                 status = "authenticated"
                 instructions = "Shared lab OpenSSH ControlMaster is active."
+                operator_hint = None
+                error = None
             else:
                 status = "unavailable"
-                instructions = (
+                instructions = HPC_UNAVAILABLE_USER_MSG
+                operator_hint = (
                     "Shared lab HPC session is down. Operator: run "
                     "./ssh_login_bouchet.sh on the API host and complete Duo."
                 )
+                error = HPC_UNAVAILABLE_USER_MSG
             return {
                 "status": status,
                 "mfa_required": False,
@@ -176,7 +180,8 @@ class MfaBridge:
                 "instructions": instructions,
                 "prompt": "",
                 "options": [],
-                "error": None if alive else (self.error or HPC_UNAVAILABLE_USER_MSG),
+                "error": error,
+                "operator_hint": operator_hint,
                 "updated_at": self.updated_at,
                 "backend": "openssh",
                 "host_alias": SSH_HOST_ALIAS,
