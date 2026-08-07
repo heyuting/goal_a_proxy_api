@@ -8,5 +8,5 @@ exec gunicorn \
   --workers 1 \
   --threads 4 \
   --bind "${BIND_HOST:-0.0.0.0}:${PORT:-8000}" \
-  --timeout 300 \
+  --timeout 660 \
   app:app

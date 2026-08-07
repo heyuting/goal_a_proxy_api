@@ -15,11 +15,15 @@ EnvironmentFile=-/home/yhs5/webapp/goal_a_proxy_api/.env
 
 # Prefer the project venv if present; otherwise system gunicorn on PATH.
 # Edit ExecStart if your venv path differs.
+# Watershed generation can run up to ~600s in the Flask handler; keep
+# gunicorn above that so the worker is not killed mid-request (clients then
+# often see an HTML 502/504 and fail JSON.parse).
 ExecStart=/home/yhs5/webapp/goal_a_proxy_api/.venv/bin/gunicorn \
   --workers 1 \
   --threads 4 \
   --bind 0.0.0.0:8000 \
-  --timeout 300 \
+  --timeout 660 \
+  --graceful-timeout 60 \
   --access-logfile - \
   --error-logfile - \
   app:app
@@ -27,8 +31,8 @@ ExecStart=/home/yhs5/webapp/goal_a_proxy_api/.venv/bin/gunicorn \
 Restart=always
 RestartSec=5
 
-# Soft stop so in-flight requests can finish
-TimeoutStopSec=30
+# Soft stop so in-flight requests can finish (incl. long watershed runs)
+TimeoutStopSec=120
 KillMode=mixed
 
 # Reasonable defaults for a web process

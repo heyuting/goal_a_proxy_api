@@ -305,7 +305,7 @@ If the frontend amber banner is up, re-run `./ssh_login_bouchet.sh` on the API h
 
 ```bash
 ./ssh_login_bouchet.sh
-gunicorn --workers 1 --threads 4 --bind 127.0.0.1:8000 --timeout 300 app:app
+gunicorn --workers 1 --threads 4 --bind 127.0.0.1:8000 --timeout 660 app:app
 ```
 
 Use `CORS_ORIGINS=http://localhost:5173`.
