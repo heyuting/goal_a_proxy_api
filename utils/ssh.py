@@ -64,6 +64,19 @@ def _hpc_unavailable(ops_detail):
     mfa_bridge.mark_failed(ops_detail)
     raise Exception(HPC_UNAVAILABLE_USER_MSG)
 
+
+def ensure_hpc_available():
+    """
+    Raise HPC_UNAVAILABLE_USER_MSG unless the shared-lab ControlMaster is up.
+    Call before accepting job submissions so the UI gets an immediate error.
+    """
+    require_ssh_credentials()
+    if not control_master_alive():
+        _hpc_unavailable(
+            f"No OpenSSH ControlMaster for {SSH_HOST_ALIAS}; "
+            "run ./ssh_login_bouchet.sh on the API host"
+        )
+
 _ssh_pool_lock = threading.RLock()
 _ssh_pool_client = None
 _ssh_pool_last_used = None

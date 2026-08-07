@@ -18,7 +18,7 @@ from utils.ssh import (
     reset_ssh_connection_pool,
     ssh_exec_read,
     BOUCHET_USER,
-    require_ssh_credentials,
+    ensure_hpc_available,
 )
 
 scepter_bp = Blueprint("scepter", __name__)
@@ -883,7 +883,7 @@ def submit_baseline_simulation():
         return response, 200
 
     try:
-        require_ssh_credentials()
+        ensure_hpc_available()
 
         payload = request.get_json(silent=True) or {}
         coordinate = payload.get("coordinate") or payload.get("coordinates")
@@ -1111,7 +1111,7 @@ def submit_baseline_simulation_batch():
         return response, 200
 
     try:
-        require_ssh_credentials()
+        ensure_hpc_available()
 
         payload = request.get_json(silent=True) or {}
         coordinates = payload.get("coordinates") or payload.get("locations")
@@ -1344,6 +1344,13 @@ exit 0
                     current_app.logger.error(
                         f"Baseline batch submission error for {batch_id}: {str(e)}"
                     )
+                    for jid in job_ids:
+                        if jid in JOB_STATUS_CACHE:
+                            JOB_STATUS_CACHE[jid].update(
+                                {"status": "failed", "error": str(e)}
+                            )
+                    if batch_id in BATCH_JOB_CACHE:
+                        BATCH_JOB_CACHE[batch_id]["error"] = str(e)
                 finally:
                     if ssh:
                         try:
@@ -1830,7 +1837,7 @@ def submit_run_scepter_model():
         return response, 200
 
     try:
-        require_ssh_credentials()
+        ensure_hpc_available()
 
         payload = request.get_json(silent=True) or {}
         spinup_name = payload.get("spinup_name") or payload.get("spinupName")
@@ -2132,7 +2139,7 @@ def submit_run_scepter_model_batch():
         return response, 200
 
     try:
-        require_ssh_credentials()
+        ensure_hpc_available()
 
         payload = request.get_json(silent=True) or {}
         locations = (

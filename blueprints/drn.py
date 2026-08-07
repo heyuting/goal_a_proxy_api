@@ -15,7 +15,7 @@ from utils.ssh import (
     get_ssh_connection,
     get_ssh_connection_pooled,
     BOUCHET_USER,
-    require_ssh_credentials,
+    ensure_hpc_available,
 )
 
 drn_bp = Blueprint("drn", __name__)
@@ -508,7 +508,7 @@ def submit_full_drn_pipeline():
             return response, 200
 
     try:
-        require_ssh_credentials()
+        ensure_hpc_available()
 
         payload = request.get_json(silent=True) or {}
         current_app.logger.debug(f"Full pipeline request payload: {payload}")
