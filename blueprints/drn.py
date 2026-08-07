@@ -178,12 +178,89 @@ def _finalize_drn_status_payload(ssh, payload):
 _DRN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
-def _resolve_drn_models_dir():
+def _has_drn_lookup(path, stem):
+    data_dir = os.path.join(path, "input", "data")
+    return os.path.isfile(os.path.join(data_dir, f"{stem}.pkl")) or os.path.isfile(
+        os.path.join(data_dir, f"{stem}.rds")
+    )
+
+
+def _has_drn_shp(path, name):
+    shp_dir = os.path.join(path, "input", "shp")
+    return os.path.isdir(os.path.join(shp_dir, name)) or os.path.isfile(
+        os.path.join(shp_dir, f"{name}.shp")
+    )
+
+
+def _drn_models_dir_ready(path, direction="downstream"):
+    """True if path has the shapefiles + lookup tables needed for site selection."""
+    if not path or not os.path.isdir(path):
+        return False
+    if not _has_drn_shp(path, "sf_river_seg_number") or not _has_drn_shp(
+        path, "sf_basin_us"
+    ):
+        return False
+    direction = (direction or "downstream").lower().strip()
+    if direction == "upstream":
+        return _has_drn_lookup(path, "l_up_total")
+    return _has_drn_lookup(path, "l_down_total") and _has_drn_lookup(
+        path, "l_up_close_total"
+    )
+
+
+def _missing_drn_inputs(path, direction="downstream"):
+    """Human-readable list of missing DRN input files under path."""
+    missing = []
+    if not _has_drn_shp(path, "sf_river_seg_number"):
+        missing.append("input/shp/sf_river_seg_number")
+    if not _has_drn_shp(path, "sf_basin_us"):
+        missing.append("input/shp/sf_basin_us")
+    direction = (direction or "downstream").lower().strip()
+    if direction == "upstream":
+        if not _has_drn_lookup(path, "l_up_total"):
+            missing.append("input/data/l_up_total.pkl (or .rds)")
+    else:
+        if not _has_drn_lookup(path, "l_down_total"):
+            missing.append("input/data/l_down_total.pkl (or .rds)")
+        if not _has_drn_lookup(path, "l_up_close_total"):
+            missing.append("input/data/l_up_close_total.pkl (or .rds)")
+    return missing
+
+
+def _subprocess_error_message(result, label="Subprocess"):
+    """Build a useful error string when a child process fails (incl. empty output)."""
+    stderr = (result.stderr or "").strip()
+    stdout = (result.stdout or "").strip()
+    parts = [p for p in (stderr, stdout) if p]
+    if parts:
+        return "\n".join(parts)
+    code = result.returncode
+    hint = (
+        f"{label} exited with code {code} and no output. "
+        "Common causes on Spinup: incomplete DRN_MODELS_DIR (missing .pkl lookup "
+        "tables), process killed (OOM), or a native library crash."
+    )
+    if code and code < 0:
+        hint += f" Signal {-code} (e.g. 9=SIGKILL/OOM)."
+    elif code == 137:
+        hint += " Exit 137 usually means OOM kill."
+    return hint
+
+
+def _site_selection_subprocess_env():
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+    env["MPLBACKEND"] = "Agg"  # headless; systemd has no display
+    return env
+
+
+def _resolve_drn_models_dir(direction="downstream"):
     """
     Directory that contains input/data and input/shp for 01_site_selection.py.
 
     Prefer DRN_MODELS_DIR (or DRN_R_CODE_DIR) on Spinup, where laptop/Bouchet
-    paths are usually unavailable.
+    paths are usually unavailable. Requires real lookup tables + shapefiles,
+    not just an empty input/data directory.
     """
     candidates = []
     for env_key in ("DRN_MODELS_DIR", "DRN_R_CODE_DIR"):
@@ -204,8 +281,12 @@ def _resolve_drn_models_dir():
                 "R_code",
             ),
             os.path.join(os.path.expanduser("~"), "webapp", "DRN", "R_code"),
+            os.path.join(os.path.expanduser("~"), "model_data", "DRN"),
+            os.path.join(os.path.expanduser("~"), "model_data", "DRN", "R_code"),
             os.path.join(os.path.expanduser("~"), "DRN", "R_code"),
             "/home/yhs5/webapp/DRN/R_code",
+            "/home/yhs5/model_data/DRN",
+            "/home/yhs5/model_data/DRN/R_code",
             "/home/yhs5/project_pi_par35/yhs5/DRN/R_code",
             os.path.join(os.getcwd(), "Models", "DRN", "R_code"),
             os.getcwd(),
@@ -217,8 +298,7 @@ def _resolve_drn_models_dir():
         if not path or path in seen:
             continue
         seen.add(path)
-        input_data_dir = os.path.join(path, "input", "data")
-        if os.path.isdir(input_data_dir):
+        if _drn_models_dir_ready(path, direction=direction):
             return path
     return None
 
@@ -2121,16 +2201,30 @@ def generate_watershed():
             )
 
             # Directory with input/data + input/shp (see DRN_MODELS_DIR on Spinup)
-            drn_models_dir = _resolve_drn_models_dir()
+            drn_models_dir = _resolve_drn_models_dir(direction=direction)
             if not drn_models_dir:
+                env_dir = (
+                    os.getenv("DRN_MODELS_DIR") or os.getenv("DRN_R_CODE_DIR") or ""
+                ).strip()
+                detail = ""
+                if env_dir:
+                    expanded = os.path.expanduser(env_dir.strip('"').strip("'"))
+                    missing = _missing_drn_inputs(expanded, direction=direction)
+                    detail = (
+                        f" DRN_MODELS_DIR={expanded} is missing: "
+                        + (", ".join(missing) if missing else "required input files")
+                        + "."
+                    )
                 return (
                     jsonify(
                         {
                             "error": (
-                                "Could not find DRN models directory with input/data. "
-                                "On Spinup, copy or symlink the DRN R_code tree (with "
-                                "input/data and input/shp), then set DRN_MODELS_DIR "
-                                "in .env to that path (e.g. /home/yhs5/webapp/DRN/R_code)."
+                                "Could not find a complete DRN models directory "
+                                "(input/data lookup tables + input/shp). "
+                                "On Spinup, point DRN_MODELS_DIR in .env at the tree "
+                                "that contains those files "
+                                "(e.g. /home/yhs5/model_data/DRN)."
+                                + detail
                             )
                         }
                     ),
@@ -2140,22 +2234,10 @@ def generate_watershed():
                 f"Found DRN models directory at: {drn_models_dir}"
             )
 
-            if direction == "upstream":
-                up_pkl = os.path.join(drn_models_dir, "input", "data", "l_up_total.pkl")
-                up_rds = os.path.join(drn_models_dir, "input", "data", "l_up_total.rds")
-                if not os.path.exists(up_pkl) and not os.path.exists(up_rds):
-                    return (
-                        jsonify(
-                            {
-                                "error": "Upstream watershed lookup (l_up_total.pkl) not found in DRN input/data."
-                            }
-                        ),
-                        500,
-                    )
-
             # Run 01_site_selection.py with the same interpreter as the API (venv)
             cmd = [
                 sys.executable,
+                "-u",
                 site_selection_script,
                 "--coords-file",
                 tmp_coords_file,
@@ -2172,11 +2254,16 @@ def generate_watershed():
                 capture_output=True,
                 text=True,
                 timeout=600,  # upstream dissolve of large basins can be slow
+                env=_site_selection_subprocess_env(),
             )
 
             if result.returncode != 0:
-                error_msg = result.stderr or result.stdout or "Unknown error"
-                current_app.logger.error(f"Watershed generation failed: {error_msg}")
+                error_msg = _subprocess_error_message(
+                    result, label="Watershed generation"
+                )
+                current_app.logger.error(
+                    f"Watershed generation failed (code={result.returncode}): {error_msg}"
+                )
                 return (
                     jsonify({"error": f"Failed to generate watersheds: {error_msg}"}),
                     500,
@@ -2582,18 +2669,30 @@ def check_outlet_compatibility():
             # Run the script locally using subprocess
             import subprocess
 
-            cmd = [sys.executable, script_path, "--coords-file", tmp_coords_file]
+            cmd = [
+                sys.executable,
+                "-u",
+                script_path,
+                "--coords-file",
+                tmp_coords_file,
+            ]
 
             current_app.logger.debug(
                 f"Running outlet compatibility check: {' '.join(cmd)}"
             )
 
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=60  # 60 second timeout
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60,  # 60 second timeout
+                env=_site_selection_subprocess_env(),
             )
 
             if result.returncode != 0:
-                error_msg = result.stderr or result.stdout or "Unknown error"
+                error_msg = _subprocess_error_message(
+                    result, label="Outlet compatibility check"
+                )
                 current_app.logger.error(
                     f"Outlet compatibility check failed: {error_msg}"
                 )
@@ -2654,14 +2753,18 @@ def check_outlet_compatibility():
                             current_app.logger.info(
                                 f"Generating watersheds using {site_selection_script}"
                             )
-                            drn_models_dir = _resolve_drn_models_dir()
+                            drn_models_dir = _resolve_drn_models_dir(
+                                direction="downstream"
+                            )
                             if not drn_models_dir:
                                 current_app.logger.warning(
-                                    "Skipping watershed generation: DRN_MODELS_DIR / input/data not found"
+                                    "Skipping watershed generation: complete DRN_MODELS_DIR "
+                                    "(input/data lookups + input/shp) not found"
                                 )
                             else:
                                 cmd = [
                                     sys.executable,
+                                    "-u",
                                     site_selection_script,
                                     "--coords-file",
                                     tmp_coords_file,
@@ -2676,6 +2779,7 @@ def check_outlet_compatibility():
                                     capture_output=True,
                                     text=True,
                                     timeout=300,  # 5 minute timeout for watershed generation
+                                    env=_site_selection_subprocess_env(),
                                 )
 
                                 if result.returncode == 0:
@@ -2742,13 +2846,12 @@ def check_outlet_compatibility():
                                     except Exception:
                                         pass
                                 else:
-                                    error_msg = (
-                                        result.stderr
-                                        or result.stdout
-                                        or "Unknown error"
+                                    error_msg = _subprocess_error_message(
+                                        result, label="Watershed generation"
                                     )
                                     current_app.logger.warning(
-                                        f"Watershed generation failed: {error_msg}"
+                                        f"Watershed generation failed "
+                                        f"(code={result.returncode}): {error_msg}"
                                     )
                                     # Don't fail the outlet check if watershed generation fails
                         else:
