@@ -51,6 +51,19 @@ MFA_RESPONSE_TIMEOUT_SEC = int(os.getenv("MFA_RESPONSE_TIMEOUT_SEC", "150"))
 SSH_BANNER_TIMEOUT_SEC = int(os.getenv("SSH_BANNER_TIMEOUT_SEC", "60"))
 SSH_AUTH_TIMEOUT_SEC = int(os.getenv("SSH_AUTH_TIMEOUT_SEC", "180"))
 
+# Shared lab account: end users should not see operator SSH/Duo instructions.
+HPC_UNAVAILABLE_USER_MSG = (
+    "Yale HPC is temporarily unavailable. Please try again later. "
+    "If this persists, contact the site administrator."
+)
+
+
+def _hpc_unavailable(ops_detail):
+    """Log operator detail; raise a user-facing message for API responses."""
+    logger.error("HPC unavailable: %s", ops_detail)
+    mfa_bridge.mark_failed(ops_detail)
+    raise Exception(HPC_UNAVAILABLE_USER_MSG)
+
 _ssh_pool_lock = threading.RLock()
 _ssh_pool_client = None
 _ssh_pool_last_used = None
@@ -134,26 +147,23 @@ class MfaBridge:
         with self._lock:
             if alive:
                 status = "authenticated"
-                instructions = (
-                    "OpenSSH ControlMaster is active. "
-                    "The API reuses that session; Python does not load your private key."
-                )
+                instructions = "Shared lab OpenSSH ControlMaster is active."
             else:
-                status = "mfa_required"
+                status = "unavailable"
                 instructions = (
-                    "No OpenSSH ControlMaster session. On the API (Spinup) host run:\n"
-                    "  ./ssh_login_bouchet.sh\n"
-                    "Complete Duo in that terminal once. Then retry the job from the web UI."
+                    "Shared lab HPC session is down. Operator: run "
+                    "./ssh_login_bouchet.sh on the API host and complete Duo."
                 )
             return {
                 "status": status,
-                "mfa_required": not alive,
+                "mfa_required": False,
+                "available": alive,
                 "auth_id": None,
-                "title": "Yale HPC OpenSSH session",
+                "title": "Yale HPC (shared lab account)",
                 "instructions": instructions,
                 "prompt": "",
                 "options": [],
-                "error": self.error,
+                "error": None if alive else (self.error or HPC_UNAVAILABLE_USER_MSG),
                 "updated_at": self.updated_at,
                 "backend": "openssh",
                 "host_alias": SSH_HOST_ALIAS,
@@ -191,13 +201,10 @@ class MfaBridge:
         )
 
     def submit_response(self, response, auth_id=None):
+        # Browser Duo is not used with the shared-lab OpenSSH backend.
         if control_master_alive():
             return True, None
-        return (
-            False,
-            "Complete Duo on the API host with ./ssh_login_bouchet.sh "
-            "(OpenSSH manages your key; the browser cannot inject the private key).",
-        )
+        return False, HPC_UNAVAILABLE_USER_MSG
 
 
 mfa_bridge = MfaBridge()
@@ -318,13 +325,9 @@ class OpenSSHClient:
                 or "authentication" in lower
                 or "there are no available authentication methods" in lower
             ):
-                hint = (
-                    f"{err}. OpenSSH has no usable ControlMaster session. "
-                    "On the API host run ./ssh_login_bouchet.sh and complete Duo, "
-                    "then retry."
+                _hpc_unavailable(
+                    f"{err}. No usable ControlMaster; run ./ssh_login_bouchet.sh"
                 )
-                mfa_bridge.mark_failed(hint)
-                raise Exception(hint)
 
         stdout = _Stream(result.stdout or b"", result.returncode)
         stderr = _Stream(result.stderr or b"", result.returncode)
@@ -366,13 +369,10 @@ def get_ssh_connection():
     mfa_bridge.begin_connecting()
 
     if not control_master_alive():
-        hint = (
-            "No OpenSSH ControlMaster for "
-            f"{SSH_HOST_ALIAS}. Run ./ssh_login_bouchet.sh on the API host, "
-            "complete Duo once, then retry. Python does not manage your private key."
+        _hpc_unavailable(
+            f"No OpenSSH ControlMaster for {SSH_HOST_ALIAS}; "
+            "run ./ssh_login_bouchet.sh on the API host"
         )
-        mfa_bridge.mark_failed(hint)
-        raise Exception(hint)
 
     # Cheap connectivity check
     client = OpenSSHClient()
@@ -380,9 +380,7 @@ def get_ssh_connection():
     code = stdout.channel.recv_exit_status()
     if code != 0:
         err = stderr.read().decode(errors="replace").strip()
-        hint = err or "OpenSSH ControlMaster check command failed"
-        mfa_bridge.mark_failed(hint)
-        raise Exception(hint)
+        _hpc_unavailable(err or "OpenSSH ControlMaster check command failed")
 
     mfa_bridge.mark_authenticated()
     logger.info(
