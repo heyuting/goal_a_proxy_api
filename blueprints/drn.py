@@ -232,25 +232,49 @@ def _subprocess_error_message(result, label="Subprocess"):
     stderr = (result.stderr or "").strip()
     stdout = (result.stdout or "").strip()
     parts = [p for p in (stderr, stdout) if p]
-    if parts:
-        return "\n".join(parts)
     code = result.returncode
-    hint = (
-        f"{label} exited with code {code} and no output. "
-        "Common causes on Spinup: incomplete DRN_MODELS_DIR (missing .pkl lookup "
-        "tables), process killed (OOM), or a native library crash."
-    )
-    if code and code < 0:
-        hint += f" Signal {-code} (e.g. 9=SIGKILL/OOM)."
+    signal_hint = ""
+    if code is not None and code < 0:
+        signal_hint = f" Killed by signal {-code} (9=SIGKILL, often OOM)."
     elif code == 137:
-        hint += " Exit 137 usually means OOM kill."
-    return hint
+        signal_hint = " Exit 137 usually means OOM kill."
+
+    if parts:
+        body = "\n".join(parts)
+        # Progress-only stdout + abrupt death ≈ OOM while loading large DRN inputs
+        progress_only = (
+            not stderr
+            and stdout.count("\n") < 3
+            and any(
+                marker in stdout
+                for marker in (
+                    "Loading input data",
+                    "Loading basin",
+                    "Loading river",
+                    "Loading network",
+                )
+            )
+        )
+        if progress_only or signal_hint:
+            return (
+                f"{body}\n({label} exit code {code}.{signal_hint} "
+                "If this stops mid-load, the Spinup VM likely ran out of memory; "
+                "try a larger VM or free RAM.)"
+            )
+        return f"{body}\n({label} exit code {code}.{signal_hint})"
+
+    return (
+        f"{label} exited with code {code} and no output.{signal_hint} "
+        "Common causes on Spinup: incomplete DRN_MODELS_DIR, OOM kill, "
+        "or a native library crash."
+    )
 
 
 def _site_selection_subprocess_env():
     env = os.environ.copy()
     env["PYTHONUNBUFFERED"] = "1"
     env["MPLBACKEND"] = "Agg"  # headless; systemd has no display
+    env["SKIP_WATERSHED_FIGURE"] = "1"  # PNG not needed for API GeoJSON response
     return env
 
 

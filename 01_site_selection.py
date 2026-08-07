@@ -10,7 +10,9 @@ Usage:
 """
 
 import argparse
+import gc
 import json
+import os
 import pickle
 import sys
 import warnings
@@ -18,9 +20,6 @@ from pathlib import Path
 
 import geopandas as gpd
 import pandas as pd
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
-from matplotlib.colors import LinearSegmentedColormap
 import numpy as np
 
 # Suppress warnings (similar to R's suppressMessages)
@@ -176,34 +175,14 @@ def run_site_selection(
     (output_dir / "shp").mkdir(exist_ok=True)
     (output_dir / "figure").mkdir(exist_ok=True)
 
-    print(f"Loading input data (direction={direction})...")
-
-    # Read lookup tables (pickle files - converted from RDS)
+    # Memory-conscious load order (Spinup VMs are often tight on RAM):
+    # basin → point join → free basin → river attrs → pickles → river geoms →
+    # reload basin for network polygons only. Avoid holding national layers
+    # and both lookup tables in memory at once.
     input_data_dir = base_dir / "input" / "data"
-    if direction == "upstream":
-        l_up_COMID_all = load_lookup_data(input_data_dir / "l_up_total.rds")
-        l_up_close_COMID_all = None
-        l_down_COMID_all = None
-    else:
-        l_up_COMID_all = None
-        l_up_close_COMID_all = load_lookup_data(input_data_dir / "l_up_close_total.rds")
-        l_down_COMID_all = load_lookup_data(input_data_dir / "l_down_total.rds")
-
-    # Read spatial data
     input_shp_dir = base_dir / "input" / "shp"
-    sf_river_region = gpd.read_file(input_shp_dir / "sf_river_seg_number", quiet=True)
-    sf_ws_region = gpd.read_file(input_shp_dir / "sf_basin_us", quiet=True)
 
-    # Normalize COMID columns once for reliable lookups/filters
-    sf_river_region["COMID"] = sf_river_region["COMID"].map(normalize_comid)
-    sf_ws_region["COMID"] = sf_ws_region["COMID"].map(normalize_comid)
-
-    # Convert to data table (drop geometry for attribute table)
-    dt_river_region = pd.DataFrame(sf_river_region.drop(columns="geometry"))
-
-    print(f"Processing {len(coordinates)} point(s)...")
-
-    # Create point GeoDataFrame
+    print(f"Processing {len(coordinates)} point(s) (direction={direction})...")
     points_df = pd.DataFrame(coordinates, columns=["x", "y"])
     sf_point = gpd.GeoDataFrame(
         points_df,
@@ -211,28 +190,64 @@ def run_site_selection(
         crs="EPSG:4326",
     )
 
-    # Ensure watershed region is in same CRS
+    print("Loading basin shapefile for point → COMID join...")
+    sf_ws_region = gpd.read_file(input_shp_dir / "sf_basin_us", quiet=True)
+    keep_cols = [c for c in ("COMID", "geometry") if c in sf_ws_region.columns]
+    sf_ws_region = sf_ws_region[keep_cols]
+    sf_ws_region["COMID"] = sf_ws_region["COMID"].map(normalize_comid)
     if sf_ws_region.crs != sf_point.crs:
         sf_ws_region = sf_ws_region.to_crs(sf_point.crs)
 
-    # Intersect points with watersheds (equivalent to st_intersection)
     print("Finding intersecting watersheds (this may take time)...")
-    sf_ws_point = gpd.sjoin(sf_ws_region, sf_point, how="inner", predicate="intersects")
+    sf_ws_point = gpd.sjoin(
+        sf_ws_region, sf_point, how="inner", predicate="intersects"
+    )
+    del sf_ws_region
+    gc.collect()
 
     if len(sf_ws_point) == 0:
         raise ValueError(
             "No watersheds found for the given coordinates. Check coordinates are within CONUS."
         )
 
+    # Keep only columns needed later for selected-point watershed polygons
+    sf_ws_point = sf_ws_point[["COMID", "geometry", "index_right"]].copy()
+    sf_ws_point["COMID"] = sf_ws_point["COMID"].map(normalize_comid)
+
     s_COMID = [normalize_comid(c) for c in sf_ws_point["COMID"].values]
     print(f"Found {len(s_COMID)} matching COMID(s): {s_COMID}")
-
-    # Select river segments that receive EW / contain click points
     comid_sel = list(dict.fromkeys(s_COMID))  # unique, preserve order
+
+    print("Loading river attributes...")
+    sf_river_region = gpd.read_file(
+        input_shp_dir / "sf_river_seg_number", quiet=True
+    )
+    sf_river_region["COMID"] = sf_river_region["COMID"].map(normalize_comid)
+    attr_cols = [
+        c
+        for c in ("COMID", "outlet", "Length", "ws_area")
+        if c in sf_river_region.columns
+    ]
+    dt_river_region = pd.DataFrame(sf_river_region[attr_cols])
+    # Keep geometry only for later network layers; drop heavy attribute copies
+    sf_river_region = sf_river_region[["COMID", "geometry"]].copy()
+    gc.collect()
+
+    print("Loading network lookup tables...")
+    if direction == "upstream":
+        l_up_COMID_all = load_lookup_data(input_data_dir / "l_up_total.rds")
+        l_up_close_COMID_all = None
+        l_down_COMID_all = None
+    else:
+        l_up_COMID_all = None
+        l_up_close_COMID_all = load_lookup_data(
+            input_data_dir / "l_up_close_total.rds"
+        )
+        l_down_COMID_all = load_lookup_data(input_data_dir / "l_down_total.rds")
 
     # Create dt_ws_rock (equivalent to data.table subset)
     dt_ws_rock = dt_river_region[dt_river_region["COMID"].isin(comid_sel)][
-        ["COMID", "outlet", "Length", "ws_area"]
+        [c for c in ("COMID", "outlet", "Length", "ws_area") if c in dt_river_region.columns]
     ].copy()
 
     if direction == "upstream":
@@ -345,12 +360,44 @@ def run_site_selection(
 
     # Get spatial features for this region
     rock_comids = [normalize_comid(c) for c in dt_ws_rock["COMID"]]
-    outlet_comids = [normalize_comid(c) for c in dt_ws_rock["outlet"].unique()]
+    outlet_comids = [
+        normalize_comid(c) for c in dt_ws_rock["outlet"].unique()
+    ] if "outlet" in dt_ws_rock.columns else []
 
-    sf_river_rock = sf_river_region[sf_river_region["COMID"].isin(rock_comids)].copy()
-    sf_ws_outlet = sf_ws_region[sf_ws_region["COMID"].isin(outlet_comids)].copy()
+    river_needed = set(rock_comids) | set(v_COMID_ode_unique) | set(
+        v_COMID_ode_up_unique_tributary
+    )
+    sf_river_needed = sf_river_region[
+        sf_river_region["COMID"].isin(list(river_needed))
+    ].copy()
+    del sf_river_region
+    gc.collect()
 
-    sf_ws_all = sf_ws_region[sf_ws_region["COMID"].isin(v_COMID_all)].copy()
+    sf_river_rock = sf_river_needed[
+        sf_river_needed["COMID"].isin(rock_comids)
+    ].copy()
+    sf_river_ode = sf_river_needed[
+        sf_river_needed["COMID"].isin(v_COMID_ode_unique)
+    ].copy()
+    sf_river_trib = sf_river_needed[
+        sf_river_needed["COMID"].isin(v_COMID_ode_up_unique_tributary)
+    ].copy()
+    del sf_river_needed
+    gc.collect()
+
+    # Reload basin only for the COMIDs we need (avoids keeping national basin
+    # in memory together with the full river layer + lookup tables).
+    basin_needed = set(v_COMID_all) | set(outlet_comids)
+    print(f"Loading basin polygons for {len(basin_needed)} network COMID(s)...")
+    sf_ws_region = gpd.read_file(input_shp_dir / "sf_basin_us", quiet=True)
+    sf_ws_region = sf_ws_region[["COMID", "geometry"]].copy()
+    sf_ws_region["COMID"] = sf_ws_region["COMID"].map(normalize_comid)
+    sf_ws_all = sf_ws_region[sf_ws_region["COMID"].isin(list(v_COMID_all))].copy()
+    sf_ws_outlet = sf_ws_region[
+        sf_ws_region["COMID"].isin(outlet_comids)
+    ].copy()
+    del sf_ws_region
+    gc.collect()
 
     # For upstream mode, dissolve catchments into one contributing-watershed polygon
     # so the map shows the full drainage area, not only the clicked local catchment.
@@ -359,23 +406,13 @@ def run_site_selection(
         sf_ws_all = sf_ws_all.dissolve().reset_index(drop=True)
         sf_ws_all["COMID"] = comid_sel[0] if len(comid_sel) == 1 else -1
 
-    sf_river_ode = sf_river_region[
-        sf_river_region["COMID"].isin(v_COMID_ode_unique)
-    ].copy()
-    sf_river_trib = sf_river_region[
-        sf_river_region["COMID"].isin(v_COMID_ode_up_unique_tributary)
-    ].copy()
-
     # Calculate centroids
     sf_river_middle = sf_river_rock.copy()
     if len(sf_river_middle) > 0:
         sf_river_middle["geometry"] = sf_river_rock.centroid
 
-    # Create watershed shapefile for selected points (watersheds that contain each point)
-    # sf_ws_point contains the intersection result - extract just the watershed polygons
-    # Drop point-related columns and keep only watershed data
+    # Watersheds containing selected points (from earlier spatial join)
     sf_ws_selected = sf_ws_point[["COMID", "geometry"]].copy()
-    # Remove duplicates (in case multiple points are in the same watershed)
     sf_ws_selected = sf_ws_selected.drop_duplicates(subset=["COMID"]).reset_index(
         drop=True
     )
@@ -449,35 +486,35 @@ def run_site_selection(
     with open(output_dir / "data" / "point_watershed_map.json", "w") as f:
         json.dump(point_watershed_map, f, indent=2)
 
-    # Create plot
-    if len(sf_ws_all) > 0:
+    # Optional PNG (skipped by API via SKIP_WATERSHED_FIGURE=1 — saves RAM)
+    skip_figure = os.getenv("SKIP_WATERSHED_FIGURE", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if not skip_figure and len(sf_ws_all) > 0:
         print("Creating visualization...")
+        import matplotlib.pyplot as plt
+
         bbox = sf_ws_all.total_bounds
         width = bbox[2] - bbox[0]
         asp_ratio = (bbox[3] - bbox[1]) / width if width > 0 else 1.0
 
         fig, ax = plt.subplots(figsize=(6, 6 * asp_ratio), dpi=500)
 
-        # Plot watersheds (background)
         sf_ws_all.plot(
             ax=ax, color="#eeeeee", edgecolor="#aaaaaa", linewidth=0.1, alpha=0.5
         )
-
-        # Plot rivers
         if len(sf_river_ode) > 0:
             sf_river_ode.plot(ax=ax, color=C_S[5], linewidth=0.2)
         if len(sf_river_trib) > 0:
             sf_river_trib.plot(ax=ax, color=C_S[4], linewidth=0.15)
         if len(sf_river_rock) > 0:
             sf_river_rock.plot(ax=ax, color=C_S[0], linewidth=0.2)
-
-        # Plot outlet watershed (downstream mode only)
         if direction == "downstream" and len(sf_ws_outlet) > 0:
             sf_ws_outlet.plot(
                 ax=ax, color=C_S[5], edgecolor=C_S[5], linewidth=0.1, alpha=0.3
             )
-
-        # Plot centroids
         if len(sf_river_middle) > 0:
             sf_river_middle.plot(
                 ax=ax,
@@ -501,6 +538,8 @@ def run_site_selection(
             output_dir / "figure" / "map_river_ws.png", dpi=500, bbox_inches="tight"
         )
         plt.close()
+    elif skip_figure:
+        print("Skipping figure generation (SKIP_WATERSHED_FIGURE set).")
 
     print(f"✓ Site selection complete! Outputs saved to {output_dir}")
     return {
