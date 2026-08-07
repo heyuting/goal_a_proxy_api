@@ -6,6 +6,7 @@ from flask import Blueprint, request, jsonify, make_response, current_app
 from flask_cors import cross_origin
 import subprocess
 import os
+import sys
 import json
 import time
 import re
@@ -2152,9 +2153,9 @@ def generate_watershed():
                         500,
                     )
 
-            # Run 01_site_selection.py locally
+            # Run 01_site_selection.py with the same interpreter as the API (venv)
             cmd = [
-                "python3",
+                sys.executable,
                 site_selection_script,
                 "--coords-file",
                 tmp_coords_file,
@@ -2581,7 +2582,7 @@ def check_outlet_compatibility():
             # Run the script locally using subprocess
             import subprocess
 
-            cmd = ["python3", script_path, "--coords-file", tmp_coords_file]
+            cmd = [sys.executable, script_path, "--coords-file", tmp_coords_file]
 
             current_app.logger.debug(
                 f"Running outlet compatibility check: {' '.join(cmd)}"
@@ -2660,7 +2661,7 @@ def check_outlet_compatibility():
                                 )
                             else:
                                 cmd = [
-                                    "python3",
+                                    sys.executable,
                                     site_selection_script,
                                     "--coords-file",
                                     tmp_coords_file,
