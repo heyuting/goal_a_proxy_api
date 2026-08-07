@@ -17,6 +17,7 @@ from utils.ssh import (
     get_ssh_connection_pooled,
     BOUCHET_USER,
     ensure_hpc_available,
+    HPC_UNAVAILABLE_USER_MSG,
 )
 
 drn_bp = Blueprint("drn", __name__)
@@ -2150,9 +2151,16 @@ def generate_watershed():
         response.headers.add("Access-Control-Allow-Methods", "POST, OPTIONS")
         response.headers.add("Access-Control-Max-Age", "3600")
         return response
-    """Generate watershed for selected locations (Step 1 only) - runs locally"""
+    """
+    Generate watershed for selected locations (Step 1 only) on Bouchet HPC.
+
+    National DRN layers need ~16G RAM — too large for a small Spinup VM.
+    Submit a short SLURM job, return job_id; frontend polls status/results.
+    """
     try:
-        payload = request.get_json()
+        ensure_hpc_available()
+
+        payload = request.get_json() or {}
         coordinates = payload.get("coordinates", [])
         direction = (payload.get("direction") or "downstream").lower().strip()
         if direction not in ("downstream", "upstream"):
@@ -2165,7 +2173,6 @@ def generate_watershed():
                 400,
             )
 
-        # Validate coordinates
         if not coordinates or not isinstance(coordinates, list) or len(coordinates) < 1:
             return jsonify({"error": "At least 1 coordinate pair is required"}), 400
 
@@ -2183,239 +2190,229 @@ def generate_watershed():
             if lat < -90 or lat > 90 or lon < -180 or lon > 180:
                 return jsonify({"error": "Coordinates out of valid range"}), 400
 
-        # Run watershed generation locally (similar to outlet compatibility check)
-        import tempfile
-        import shutil
-
-        temp_output_dir = tempfile.mkdtemp(prefix="watershed_")
-
-        # Create temporary coordinates file
-        coords_data = [{"lat": c[0], "lon": c[1]} for c in coordinates]
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False
-        ) as tmp_file:
-            json.dump(coords_data, tmp_file)
-            tmp_coords_file = tmp_file.name
-
-        try:
-            # Find 01_site_selection.py script
-            site_selection_paths = [
-                os.path.join(_DRN_ROOT, "01_site_selection.py"),
-                "01_site_selection.py",
-            ]
-
-            site_selection_script = None
-            for path in site_selection_paths:
-                if os.path.exists(path):
-                    site_selection_script = path
-                    break
-
-            if not site_selection_script:
-                return (
-                    jsonify(
-                        {
-                            "error": "01_site_selection.py not found. Please ensure the script is in the backend directory."
-                        }
-                    ),
-                    500,
-                )
-
-            current_app.logger.info(
-                f"Generating {direction} watersheds using {site_selection_script}"
-            )
-
-            # Directory with input/data + input/shp (see DRN_MODELS_DIR on Spinup)
-            drn_models_dir = _resolve_drn_models_dir(direction=direction)
-            if not drn_models_dir:
-                env_dir = (
-                    os.getenv("DRN_MODELS_DIR") or os.getenv("DRN_R_CODE_DIR") or ""
-                ).strip()
-                detail = ""
-                if env_dir:
-                    expanded = os.path.expanduser(env_dir.strip('"').strip("'"))
-                    missing = _missing_drn_inputs(expanded, direction=direction)
-                    detail = (
-                        f" DRN_MODELS_DIR={expanded} is missing: "
-                        + (", ".join(missing) if missing else "required input files")
-                        + "."
-                    )
-                return (
-                    jsonify(
-                        {
-                            "error": (
-                                "Could not find a complete DRN models directory "
-                                "(input/data lookup tables + input/shp). "
-                                "On Spinup, point DRN_MODELS_DIR in .env at the tree "
-                                "that contains those files "
-                                "(e.g. /home/yhs5/model_data/DRN)."
-                                + detail
-                            )
-                        }
-                    ),
-                    500,
-                )
-            current_app.logger.info(
-                f"Found DRN models directory at: {drn_models_dir}"
-            )
-
-            # Run 01_site_selection.py with the same interpreter as the API (venv)
-            cmd = [
-                sys.executable,
-                "-u",
-                site_selection_script,
-                "--coords-file",
-                tmp_coords_file,
-                "--output-dir",
-                temp_output_dir,
-                "--script-dir",
-                drn_models_dir,
-                "--direction",
-                direction,
-            ]
-
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=600,  # upstream dissolve of large basins can be slow
-                env=_site_selection_subprocess_env(),
-            )
-
-            if result.returncode != 0:
-                error_msg = _subprocess_error_message(
-                    result, label="Watershed generation"
-                )
-                current_app.logger.error(
-                    f"Watershed generation failed (code={result.returncode}): {error_msg}"
-                )
-                return (
-                    jsonify({"error": f"Failed to generate watersheds: {error_msg}"}),
-                    500,
-                )
-
-            # Read generated shapefiles and convert to GeoJSON
-            watershed_results = {}
-            watershed_summary = {
-                "direction": direction,
-                "n_watersheds": None,
-                "n_downstream": None,
-                "n_tributaries": None,
-                "n_total": None,
-            }
-            shp_dir = os.path.join(temp_output_dir, "shp")
-            summary_path = os.path.join(
-                temp_output_dir, "data", "watershed_summary.json"
-            )
-            if os.path.exists(summary_path):
-                try:
-                    with open(summary_path, "r") as f:
-                        watershed_summary = json.load(f)
-                except Exception as e:
-                    current_app.logger.warning(
-                        f"Failed to read watershed_summary.json: {str(e)}"
-                    )
-
-            if os.path.exists(shp_dir):
-                shapefiles = {
-                    "sf_ws_all": "sf_ws_all.shp",
-                    "sf_river_ode": "sf_river_ode.shp",
-                    "sf_river_trib": "sf_river_trib.shp",
-                    "sf_river_middle": "sf_river_middle.shp",
-                }
-
-                # Try to read sf_river_rock if it exists
-                rock_shp = os.path.join(shp_dir, "sf_river_rock.shp")
-                if os.path.exists(rock_shp):
-                    shapefiles["sf_river_rock"] = "sf_river_rock.shp"
-
-                # Convert shapefiles to GeoJSON using geopandas
-                try:
-                    import geopandas as gpd
-
-                    for key, filename in shapefiles.items():
-                        shp_path = os.path.join(shp_dir, filename)
-                        if os.path.exists(shp_path):
-                            try:
-                                gdf = gpd.read_file(shp_path)
-                                # Convert to GeoJSON format
-                                watershed_results[key] = json.loads(gdf.to_json())
-                            except Exception as e:
-                                current_app.logger.warning(
-                                    f"Failed to convert {filename} to GeoJSON: {str(e)}"
-                                )
-                except ImportError:
-                    return (
-                        jsonify(
-                            {
-                                "error": "geopandas not available, cannot convert shapefiles to GeoJSON"
-                            }
-                        ),
-                        500,
-                    )
-                except Exception as e:
-                    return (
-                        jsonify({"error": f"Error converting shapefiles: {str(e)}"}),
-                        500,
-                    )
-
-            # Clean up temporary files
-            try:
-                os.unlink(tmp_coords_file)
-                shutil.rmtree(temp_output_dir)
-            except:
-                pass
-
-            if watershed_results:
-                current_app.logger.info(
-                    f"Successfully generated {len(watershed_results)} {direction} watershed layers "
-                    f"(n_watersheds={watershed_summary.get('n_watersheds')})"
-                )
-                return jsonify(
-                    {
-                        "watersheds": watershed_results,
-                        "direction": direction,
-                        "n_watersheds": watershed_summary.get("n_watersheds"),
-                        "watershed_summary": watershed_summary,
-                    }
-                )
-            else:
-                return (
-                    jsonify({"error": "No watershed files found or converted"}),
-                    500,
-                )
-
-        except subprocess.TimeoutExpired:
+        site_selection_script = None
+        for path in (
+            os.path.join(_DRN_ROOT, "01_site_selection.py"),
+            "01_site_selection.py",
+        ):
+            if os.path.exists(path):
+                site_selection_script = path
+                break
+        if not site_selection_script:
             return (
-                jsonify({"error": "Watershed generation timed out"}),
+                jsonify(
+                    {
+                        "error": "01_site_selection.py not found on the API host "
+                        "(needed to upload to Bouchet)."
+                    }
+                ),
                 500,
             )
-        except Exception as e:
-            import traceback
 
-            error_traceback = traceback.format_exc()
-            current_app.logger.error(f"Error generating watersheds: {str(e)}")
-            current_app.logger.error(f"Traceback: {error_traceback}")
-            return jsonify({"error": f"Backend error: {str(e)}"}), 500
-        finally:
-            # Clean up temporary files
-            try:
-                if os.path.exists(tmp_coords_file):
-                    os.unlink(tmp_coords_file)
-                if os.path.exists(temp_output_dir):
-                    shutil.rmtree(temp_output_dir)
-            except:
-                pass
+        timestamp = int(time.time())
+        job_id = f"ws_{str(timestamp)[-5:]}"
+        job_folder = f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN/jobs/{job_id}"
+        output_dir = f"{job_folder}/output"
+        drn_path = f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN"
+        r_code_dir = f"{drn_path}/R_code"
+        mem_gb = 16 if direction == "downstream" else 32
+
+        JOB_STATUS_CACHE[job_id] = {
+            "job_id": job_id,
+            "bouchet_job_id": None,
+            "job_folder": job_folder,
+            "output_dir": output_dir,
+            "direction": direction,
+            "status": "submitting",
+            "submitted_at": time.time(),
+            "kind": "watershed",
+        }
+
+        coords_json = json.dumps([{"lat": c[0], "lon": c[1]} for c in coordinates])
+
+        def submit_watershed_background():
+            from app import app
+
+            with app.app_context():
+                ssh = None
+                try:
+                    current_app.logger.info(
+                        f"Submitting {direction} watershed job {job_id} to Bouchet"
+                    )
+                    ssh = get_ssh_connection()
+
+                    for cmd in (
+                        f"mkdir -p {job_folder}",
+                        f"mkdir -p {output_dir}",
+                        f"cat > {job_folder}/coords.json << 'COORDS_EOF'\n{coords_json}\nCOORDS_EOF",
+                    ):
+                        stdin, stdout, stderr = ssh.exec_command(cmd)
+                        if stdout.channel.recv_exit_status() != 0:
+                            err = stderr.read().decode(errors="replace")
+                            JOB_STATUS_CACHE[job_id].update(
+                                {
+                                    "status": "failed",
+                                    "error": f"Failed to setup job folder: {err}",
+                                }
+                            )
+                            return
+
+                    # Upload current site-selection script (supports --direction)
+                    sftp = ssh.open_sftp()
+                    try:
+                        sftp.put(
+                            site_selection_script,
+                            f"{job_folder}/01_site_selection.py",
+                        )
+                    finally:
+                        sftp.close()
+
+                    sbatch_script = f"""#!/bin/bash
+#SBATCH --job-name={job_id}
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=2
+#SBATCH --mem={mem_gb}G
+#SBATCH --time=02:00:00
+#SBATCH --output={job_folder}/%x_%j.out
+#SBATCH --error={job_folder}/%x_%j.err
+
+set -euo pipefail
+export MPLBACKEND=Agg
+export SKIP_WATERSHED_FIGURE=1
+export PYTHONUNBUFFERED=1
+
+if module avail Python 2>&1 | grep -q "Python/"; then
+  module load Python/3.11 2>&1 || module load Python 2>&1 || true
+fi
+if module avail GDAL 2>&1 | grep -q "GDAL/"; then
+  module load GDAL/3.9.0 2>&1 || module load GDAL 2>&1 || true
+fi
+
+cd {drn_path}/R_code/python_version || {{
+  echo "ERROR: missing {drn_path}/R_code/python_version"
+  exit 1
+}}
+
+PYTHON_CMD=""
+for venv_path in ".venv" "venv" "../venv" "../../venv"; do
+  if [ -f "$venv_path/bin/python" ]; then
+    PYTHON_CMD="$venv_path/bin/python"
+    break
+  fi
+done
+if [ -z "$PYTHON_CMD" ]; then
+  if python3 -c "import geopandas" 2>/dev/null; then
+    PYTHON_CMD="python3"
+  else
+    echo "ERROR: No Python with geopandas found"
+    exit 1
+  fi
+fi
+
+echo "Using $($PYTHON_CMD --version) for watershed ({direction})"
+$PYTHON_CMD -u {job_folder}/01_site_selection.py \\
+  --coords-file {job_folder}/coords.json \\
+  --output-dir {output_dir} \\
+  --script-dir {r_code_dir} \\
+  --direction {direction}
+
+# Convert shapefiles → GeoJSON for lightweight fetch by the API
+$PYTHON_CMD - <<'PY'
+import json
+from pathlib import Path
+import geopandas as gpd
+
+shp_dir = Path("{output_dir}") / "shp"
+if shp_dir.is_dir():
+    for shp in shp_dir.glob("*.shp"):
+        gdf = gpd.read_file(shp)
+        out = shp.with_suffix(".geojson")
+        gdf.to_file(out, driver="GeoJSON")
+        print(f"Wrote {{out.name}}")
+summary = Path("{output_dir}") / "data" / "watershed_summary.json"
+if summary.is_file():
+    print("summary:", summary.read_text()[:200])
+PY
+
+echo "Watershed job completed at $(date)" > {job_folder}/.completed
+"""
+
+                    script_path = f"{job_folder}/job.sh"
+                    stdin, stdout, stderr = ssh.exec_command(
+                        f"cat > {script_path} << 'SCRIPT_EOF'\n{sbatch_script}\nSCRIPT_EOF"
+                    )
+                    if stdout.channel.recv_exit_status() != 0:
+                        err = stderr.read().decode(errors="replace")
+                        JOB_STATUS_CACHE[job_id].update(
+                            {
+                                "status": "failed",
+                                "error": f"Failed to write job script: {err}",
+                            }
+                        )
+                        return
+
+                    ssh.exec_command(f"chmod +x {script_path}")
+                    stdin, stdout, stderr = ssh.exec_command(f"sbatch {script_path}")
+                    result = stdout.read().decode().strip()
+                    error = stderr.read().decode().strip()
+                    exit_status = stdout.channel.recv_exit_status()
+
+                    if exit_status == 0 and "Submitted batch job" in result:
+                        bouchet_job_id = result.split()[-1]
+                        ssh.exec_command(
+                            f"echo '{bouchet_job_id}' > {job_folder}/.bouchet_job_id"
+                        )
+                        JOB_STATUS_CACHE[job_id].update(
+                            {
+                                "bouchet_job_id": bouchet_job_id,
+                                "status": "pending",
+                            }
+                        )
+                        current_app.logger.info(
+                            f"Watershed job {job_id} submitted as Bouchet {bouchet_job_id}"
+                        )
+                    else:
+                        JOB_STATUS_CACHE[job_id].update(
+                            {
+                                "status": "failed",
+                                "error": error or result or "sbatch failed",
+                            }
+                        )
+                except Exception as e:
+                    import traceback
+
+                    current_app.logger.error(
+                        f"Watershed submit failed for {job_id}: {e}\n{traceback.format_exc()}"
+                    )
+                    JOB_STATUS_CACHE[job_id].update(
+                        {"status": "failed", "error": str(e)}
+                    )
+                finally:
+                    if ssh is not None:
+                        try:
+                            ssh.close()
+                        except Exception:
+                            pass
+
+        threading.Thread(target=submit_watershed_background, daemon=True).start()
+
+        return jsonify(
+            {
+                "job_id": job_id,
+                "status": "submitting",
+                "direction": direction,
+                "message": (
+                    "Watershed generation submitted to Bouchet HPC. "
+                    "Poll /api/drn/watershed/<job_id>/status for progress."
+                ),
+            }
+        )
 
     except Exception as e:
         import traceback
 
-        error_traceback = traceback.format_exc()
-        current_app.logger.error(f"Error in generate_watershed: {str(e)}")
-        current_app.logger.error(f"Traceback: {error_traceback}")
-        return jsonify({"error": f"Backend error: {str(e)}"}), 500
-
-    except Exception as e:
-        import traceback
+        if str(e) == HPC_UNAVAILABLE_USER_MSG:
+            return jsonify({"error": str(e), "hpc_unavailable": True}), 503
 
         error_traceback = traceback.format_exc()
         current_app.logger.error(f"Error in generate_watershed: {str(e)}")
@@ -2440,25 +2437,69 @@ def check_watershed_status(job_id):
     """Check the status of a watershed generation job"""
     try:
         job_info = JOB_STATUS_CACHE.get(job_id, {})
-        bouchet_job_id = job_info.get("bouchet_job_id")
         job_folder = job_info.get(
             "job_folder",
             f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN/jobs/{job_id}",
         )
+        bouchet_job_id = job_info.get("bouchet_job_id")
+        cached_status = job_info.get("status")
 
-        if not bouchet_job_id:
-            return jsonify({"error": "Job not found"}), 404
+        if cached_status == "failed":
+            return jsonify(
+                {
+                    "job_id": job_id,
+                    "bouchet_job_id": bouchet_job_id,
+                    "status": "failed",
+                    "error": job_info.get("error"),
+                    "direction": job_info.get("direction"),
+                }
+            )
 
-        # Connect to Bouchet via SSH
+        if cached_status == "submitting" or not bouchet_job_id:
+            # Recover bouchet id from disk if API restarted mid-submit
+            try:
+                ensure_hpc_available()
+                ssh = get_ssh_connection()
+                stdin, stdout, stderr = ssh.exec_command(
+                    f"cat {job_folder}/.bouchet_job_id 2>/dev/null"
+                )
+                recovered = stdout.read().decode().strip()
+                ssh.close()
+                if recovered.isdigit():
+                    bouchet_job_id = recovered
+                    JOB_STATUS_CACHE.setdefault(job_id, {})
+                    JOB_STATUS_CACHE[job_id].update(
+                        {
+                            "bouchet_job_id": bouchet_job_id,
+                            "job_folder": job_folder,
+                            "status": "pending",
+                        }
+                    )
+                else:
+                    return jsonify(
+                        {
+                            "job_id": job_id,
+                            "status": "submitting",
+                            "direction": job_info.get("direction"),
+                        }
+                    )
+            except Exception:
+                return jsonify(
+                    {
+                        "job_id": job_id,
+                        "status": cached_status or "submitting",
+                        "direction": job_info.get("direction"),
+                    }
+                )
+
+        ensure_hpc_available()
         ssh = get_ssh_connection()
 
-        # Check SLURM job status
         squeue_cmd = f"squeue -j {bouchet_job_id} --format='%T' --noheader"
         stdin, stdout, stderr = ssh.exec_command(squeue_cmd)
         slurm_status_raw = stdout.read().decode().strip()
         slurm_status = slurm_status_raw.split("\n")[0] if slurm_status_raw else ""
 
-        # Map SLURM status (OUT_OF_MEMORY -> failed)
         status_map = {
             "PENDING": "pending",
             "RUNNING": "running",
@@ -2468,31 +2509,56 @@ def check_watershed_status(job_id):
             "TIMEOUT": "failed",
             "OUT_OF_MEMORY": "failed",
             "OUT_OF_MEMMORY": "failed",
-            "OUT_OF_ME+": "failed",  # OUT_OF_MEMORY truncated by sacct
+            "OUT_OF_ME+": "failed",
         }
 
+        error_msg = None
         if slurm_status:
             status = status_map.get(slurm_status, "unknown")
             if status == "unknown" and slurm_status.startswith("OUT_OF_ME"):
                 status = "failed"
         else:
-            # Job not in queue, check completion marker
-            check_cmd = (
-                f"test -f {job_folder}/.completed && echo 'completed' || echo 'unknown'"
+            stdin, stdout, stderr = ssh.exec_command(
+                f"test -f {job_folder}/.completed && echo completed || echo none"
             )
-            stdin, stdout, stderr = ssh.exec_command(check_cmd)
-            output_check = stdout.read().decode().strip()
-            status = "completed" if output_check == "completed" else "unknown"
+            marker = stdout.read().decode().strip()
+            if marker == "completed":
+                status = "completed"
+            else:
+                stdin, stdout, stderr = ssh.exec_command(
+                    f"sacct -j {bouchet_job_id} --format=State --noheader -X 2>/dev/null "
+                    f"| head -1 | awk '{{print $1}}'"
+                )
+                sacct_state = stdout.read().decode().strip()
+                if sacct_state in ("COMPLETED", "COMPLETING"):
+                    status = "failed"
+                    error_msg = (
+                        "Job finished on Bouchet but completion marker missing "
+                        "(check the .err log)"
+                    )
+                elif sacct_state:
+                    status = status_map.get(sacct_state, "failed")
+                    if status == "unknown" and sacct_state.startswith("OUT_OF_ME"):
+                        status = "failed"
+                    if status == "failed":
+                        error_msg = f"SLURM state: {sacct_state}"
+                else:
+                    status = "unknown"
 
         ssh.close()
 
-        return jsonify(
-            {
-                "job_id": job_id,
-                "bouchet_job_id": bouchet_job_id,
-                "status": status,
-            }
-        )
+        if job_id in JOB_STATUS_CACHE:
+            JOB_STATUS_CACHE[job_id]["status"] = status
+
+        payload = {
+            "job_id": job_id,
+            "bouchet_job_id": bouchet_job_id,
+            "status": status,
+            "direction": job_info.get("direction"),
+        }
+        if error_msg:
+            payload["error"] = error_msg
+        return jsonify(payload)
 
     except Exception as e:
         current_app.logger.error(
@@ -2515,79 +2581,83 @@ def get_watershed_results(job_id):
         response.headers.add("Access-Control-Allow-Methods", "GET, OPTIONS")
         response.headers.add("Access-Control-Max-Age", "3600")
         return response
-    """Get watershed results (Step 1 shapefiles)"""
+    """Get watershed results (Step 1 GeoJSON layers from Bouchet)."""
     try:
+        ensure_hpc_available()
         job_info = JOB_STATUS_CACHE.get(job_id, {})
         output_dir = job_info.get(
             "output_dir",
             f"/home/{BOUCHET_USER}/project_pi_par35/yhs5/DRN/jobs/{job_id}/output",
         )
+        direction = job_info.get("direction")
 
-        # Connect to Bouchet via SSH
         ssh = get_ssh_connection()
 
-        # Read GeoJSON files from Step 1 output
-        shapefiles = [
-            {"name": "sf_ws_all", "path": f"{output_dir}/shp/sf_ws_all.geojson"},
-            {
-                "name": "sf_ws_selected",
-                "path": f"{output_dir}/shp/sf_ws_selected.geojson",
-            },  # Watersheds containing selected points
-            {"name": "sf_river_ode", "path": f"{output_dir}/shp/sf_river_ode.geojson"},
-            {
-                "name": "sf_river_trib",
-                "path": f"{output_dir}/shp/sf_river_trib.geojson",
-            },
-            {
-                "name": "sf_river_middle",
-                "path": f"{output_dir}/shp/sf_river_middle.geojson",
-            },
+        layer_names = [
+            "sf_ws_all",
+            "sf_ws_selected",
+            "sf_river_ode",
+            "sf_river_trib",
+            "sf_river_middle",
+            "sf_river_rock",
         ]
-
         results = {}
-
-        for shp in shapefiles:
+        for name in layer_names:
             try:
-                read_cmd = f"cat {shp['path']} 2>/dev/null"
-                stdin, stdout, stderr = ssh.exec_command(read_cmd)
+                path = f"{output_dir}/shp/{name}.geojson"
+                stdin, stdout, stderr = ssh.exec_command(f"cat {path} 2>/dev/null")
                 geojson_content = stdout.read().decode()
-                if geojson_content:
-                    results[shp["name"]] = json.loads(geojson_content)
+                if geojson_content.strip():
+                    results[name] = json.loads(geojson_content)
             except Exception as e:
-                current_app.logger.warning(f"Failed to read {shp['name']}: {str(e)}")
-                # Continue with other files
+                current_app.logger.warning(f"Failed to read {name}: {str(e)}")
 
-        # Try to get sf_river_rock if available
-        try:
-            rock_path = f"{output_dir}/shp/sf_river_rock.geojson"
-            read_cmd = f"cat {rock_path} 2>/dev/null"
-            stdin, stdout, stderr = ssh.exec_command(read_cmd)
-            rock_content = stdout.read().decode()
-            if rock_content:
-                results["sf_river_rock"] = json.loads(rock_content)
-        except:
-            pass  # Optional file
-
-        # Try to get point-watershed mapping JSON
         point_watershed_map = None
         try:
-            map_path = f"{output_dir}/data/point_watershed_map.json"
-            read_cmd = f"cat {map_path} 2>/dev/null"
-            stdin, stdout, stderr = ssh.exec_command(read_cmd)
+            stdin, stdout, stderr = ssh.exec_command(
+                f"cat {output_dir}/data/point_watershed_map.json 2>/dev/null"
+            )
             map_content = stdout.read().decode()
-            if map_content:
+            if map_content.strip():
                 point_watershed_map = json.loads(map_content)
-        except:
-            pass  # Optional file
+        except Exception:
+            pass
+
+        watershed_summary = None
+        try:
+            stdin, stdout, stderr = ssh.exec_command(
+                f"cat {output_dir}/data/watershed_summary.json 2>/dev/null"
+            )
+            summary_content = stdout.read().decode()
+            if summary_content.strip():
+                watershed_summary = json.loads(summary_content)
+                if not direction:
+                    direction = watershed_summary.get("direction")
+        except Exception:
+            pass
 
         ssh.close()
+
+        if not results:
+            return (
+                jsonify(
+                    {
+                        "error": "No watershed GeoJSON found yet. Job may still be running."
+                    }
+                ),
+                404,
+            )
 
         response_data = {
             "job_id": job_id,
             "shapefiles": results,
+            "watersheds": results,  # alias used by sync frontend path
+            "direction": direction,
+            "n_watersheds": (
+                watershed_summary.get("n_watersheds") if watershed_summary else None
+            ),
+            "watershed_summary": watershed_summary,
         }
-
-        # Add point-watershed mapping if available
         if point_watershed_map:
             response_data["point_watershed_map"] = point_watershed_map
 

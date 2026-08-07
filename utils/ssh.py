@@ -306,6 +306,23 @@ class OpenSFTP:
             except OSError:
                 pass
 
+    def put(self, local_path, remote_path):
+        """Upload a local file to Bouchet via scp (uses ControlMaster)."""
+        cmd = [
+            "scp",
+            *_control_args(),
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            f"ConnectTimeout={SSH_CONNECT_TIMEOUT_SEC}",
+            local_path,
+            f"{self.host_alias}:{remote_path}",
+        ]
+        result = subprocess.run(cmd, capture_output=True, timeout=600)
+        if result.returncode != 0:
+            err = (result.stderr or b"").decode(errors="replace").strip()
+            raise Exception(err or f"scp put failed for {remote_path}")
+
     def close(self):
         pass
 
