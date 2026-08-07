@@ -1,0 +1,39 @@
+[Unit]
+Description=GOAL-A proxy API (gunicorn)
+Documentation=https://github.com/heyuting/goal_a_proxy_api
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yhs5
+Group=yhs5
+WorkingDirectory=/home/yhs5/webapp/goal_a_proxy_api
+
+# Loads BOUCHET_*, CORS_ORIGINS, DRN_MODELS_DIR, etc.
+EnvironmentFile=-/home/yhs5/webapp/goal_a_proxy_api/.env
+
+# Prefer the project venv if present; otherwise system gunicorn on PATH.
+# Edit ExecStart if your venv path differs.
+ExecStart=/home/yhs5/webapp/goal_a_proxy_api/.venv/bin/gunicorn \
+  --workers 1 \
+  --threads 4 \
+  --bind 0.0.0.0:8000 \
+  --timeout 300 \
+  --access-logfile - \
+  --error-logfile - \
+  app:app
+
+Restart=always
+RestartSec=5
+
+# Soft stop so in-flight requests can finish
+TimeoutStopSec=30
+KillMode=mixed
+
+# Reasonable defaults for a web process
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

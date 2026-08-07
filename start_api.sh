@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Start the proxy API with a single worker + threads (required for Duo MFA bridge).
-# On Yale Spinup, bind 0.0.0.0 so the frontend VM/browser can reach the API.
+# Foreground helper for local debugging.
+# On Spinup for always-on: use deploy/install_systemd_service.sh instead.
 set -euo pipefail
 cd "$(dirname "$0")"
 

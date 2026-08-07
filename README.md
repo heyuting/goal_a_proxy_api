@@ -246,23 +246,60 @@ http://<api-spinup-ip>:8000
 
 Include that frontend origin in `CORS_ORIGINS`.
 
-### 4. Start the API
+### 4. Keep the API running with systemd (recommended on Spinup)
+
+Do **not** rely on a laptop terminal with `./start_api.sh` — closing that shell stops gunicorn.
+
+1. Edit `deploy/goal-a-api.service` if your paths differ (`WorkingDirectory`, `User`, venv `ExecStart`).
+2. Ensure a venv exists with deps (or point `ExecStart` at system `gunicorn`):
 
 ```bash
-./start_api.sh
-# gunicorn --workers 1 --threads 4 --bind 0.0.0.0:8000 --timeout 300 app:app
+cd ~/webapp/goal_a_proxy_api
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-Single worker is still recommended for simplicity; SSH state now lives in OpenSSH’s ControlMaster socket (shared across processes), not Paramiko memory.
+3. Install and start the service:
 
-### 5. Smoke checks
+```bash
+chmod +x deploy/install_systemd_service.sh deploy/check_bouchet_ssh.sh
+./deploy/install_systemd_service.sh
+```
+
+Useful commands:
+
+```bash
+sudo systemctl status goal-a-api
+sudo journalctl -u goal-a-api -f
+sudo systemctl restart goal-a-api
+```
+
+One worker + several threads is intentional. Bouchet auth is **not** managed by systemd — that is OpenSSH ControlMaster (next step).
+
+### 5. Keep Bouchet SSH available
+
+```bash
+./ssh_login_bouchet.sh          # once after reboot / when the amber banner appears
+ssh -O check bouchet            # Master running (pid=…)
+```
+
+Optional health check every 10 minutes (emails only if `NOTIFY_EMAIL` is set and `mail` works):
+
+```bash
+crontab -e
+# add (env var before the command):
+*/10 * * * * NOTIFY_EMAIL=yuting.smeglin@yale.edu /home/yhs5/webapp/goal_a_proxy_api/deploy/check_bouchet_ssh.sh
+```
+
+### 6. Smoke checks
 
 ```bash
 curl -s http://127.0.0.1:8000/api/auth/mfa-status
-# expect "status": "authenticated" when ControlMaster is up
+# expect "available": true / "status": "authenticated" when ControlMaster is up
 ```
 
-If status is `mfa_required`, re-run `./ssh_login_bouchet.sh` on the API host.
+If the frontend amber banner is up, re-run `./ssh_login_bouchet.sh` on the API host.
 
 ## Local development (laptop)
 
