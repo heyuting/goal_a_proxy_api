@@ -177,6 +177,51 @@ def _finalize_drn_status_payload(ssh, payload):
 _DRN_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+def _resolve_drn_models_dir():
+    """
+    Directory that contains input/data and input/shp for 01_site_selection.py.
+
+    Prefer DRN_MODELS_DIR (or DRN_R_CODE_DIR) on Spinup, where laptop/Bouchet
+    paths are usually unavailable.
+    """
+    candidates = []
+    for env_key in ("DRN_MODELS_DIR", "DRN_R_CODE_DIR"):
+        raw = os.getenv(env_key)
+        if raw:
+            candidates.append(os.path.expanduser(raw.strip().strip('"').strip("'")))
+
+    candidates.extend(
+        [
+            _DRN_ROOT,  # e.g. symlink/copy input/ next to the API repo
+            os.path.abspath(os.path.join(_DRN_ROOT, "Models", "DRN", "R_code")),
+            os.path.join(
+                os.path.expanduser("~"),
+                "Desktop",
+                "YaleWork",
+                "Models",
+                "DRN",
+                "R_code",
+            ),
+            os.path.join(os.path.expanduser("~"), "webapp", "DRN", "R_code"),
+            os.path.join(os.path.expanduser("~"), "DRN", "R_code"),
+            "/home/yhs5/webapp/DRN/R_code",
+            "/home/yhs5/project_pi_par35/yhs5/DRN/R_code",
+            os.path.join(os.getcwd(), "Models", "DRN", "R_code"),
+            os.getcwd(),
+        ]
+    )
+
+    seen = set()
+    for path in candidates:
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        input_data_dir = os.path.join(path, "input", "data")
+        if os.path.isdir(input_data_dir):
+            return path
+    return None
+
+
 @drn_bp.route("/api/run-job", methods=["POST"])
 def run_job():
     current_app.logger.debug("Received request to run job")
@@ -2074,47 +2119,25 @@ def generate_watershed():
                 f"Generating {direction} watersheds using {site_selection_script}"
             )
 
-            # Determine the DRN models directory (where input data is located)
-            # The script needs to know where to find input/data and input/shp directories
-            # Try multiple possible locations
-            possible_paths = [
-                # Relative to backend directory
-                os.path.abspath(os.path.join(_DRN_ROOT, "Models", "DRN", "R_code")),
-                # Absolute path from home directory
-                os.path.join(
-                    os.path.expanduser("~"),
-                    "Desktop",
-                    "YaleWork",
-                    "Models",
-                    "DRN",
-                    "R_code",
-                ),
-                # Bouchet HPC path
-                "/home/yhs5/project_pi_par35/yhs5/DRN/R_code",
-                # Current working directory
-                os.path.join(os.getcwd(), "Models", "DRN", "R_code"),
-            ]
-
-            drn_models_dir = None
-            for path in possible_paths:
-                # Check if input/data directory exists (indicates correct path)
-                input_data_dir = os.path.join(path, "input", "data")
-                if os.path.exists(input_data_dir):
-                    drn_models_dir = path
-                    current_app.logger.info(
-                        f"Found DRN models directory at: {drn_models_dir}"
-                    )
-                    break
-
+            # Directory with input/data + input/shp (see DRN_MODELS_DIR on Spinup)
+            drn_models_dir = _resolve_drn_models_dir()
             if not drn_models_dir:
                 return (
                     jsonify(
                         {
-                            "error": "Could not find DRN models directory with input data. Please ensure the DRN models are accessible."
+                            "error": (
+                                "Could not find DRN models directory with input/data. "
+                                "On Spinup, copy or symlink the DRN R_code tree (with "
+                                "input/data and input/shp), then set DRN_MODELS_DIR "
+                                "in .env to that path (e.g. /home/yhs5/webapp/DRN/R_code)."
+                            )
                         }
                     ),
                     500,
                 )
+            current_app.logger.info(
+                f"Found DRN models directory at: {drn_models_dir}"
+            )
 
             if direction == "upstream":
                 up_pkl = os.path.join(drn_models_dir, "input", "data", "l_up_total.pkl")
@@ -2626,95 +2649,103 @@ def check_outlet_compatibility():
                             current_app.logger.info(
                                 f"Generating watersheds using {site_selection_script}"
                             )
-
-                            # Run 01_site_selection.py locally
-                            cmd = [
-                                "python3",
-                                site_selection_script,
-                                "--coords-file",
-                                tmp_coords_file,
-                                "--output-dir",
-                                temp_output_dir,
-                            ]
-
-                            result = subprocess.run(
-                                cmd,
-                                capture_output=True,
-                                text=True,
-                                timeout=300,  # 5 minute timeout for watershed generation
-                            )
-
-                            if result.returncode == 0:
-                                # Read generated shapefiles and convert to GeoJSON
-                                watershed_results = {}
-                                shp_dir = os.path.join(temp_output_dir, "shp")
-
-                                if os.path.exists(shp_dir):
-                                    shapefiles = {
-                                        "sf_ws_all": "sf_ws_all.shp",
-                                        "sf_river_ode": "sf_river_ode.shp",
-                                        "sf_river_trib": "sf_river_trib.shp",
-                                        "sf_river_middle": "sf_river_middle.shp",
-                                    }
-
-                                    # Try to read sf_river_rock if it exists
-                                    rock_shp = os.path.join(
-                                        shp_dir, "sf_river_rock.shp"
-                                    )
-                                    if os.path.exists(rock_shp):
-                                        shapefiles["sf_river_rock"] = (
-                                            "sf_river_rock.shp"
-                                        )
-
-                                    # Convert shapefiles to GeoJSON using geopandas
-                                    try:
-                                        import geopandas as gpd
-
-                                        for key, filename in shapefiles.items():
-                                            shp_path = os.path.join(shp_dir, filename)
-                                            if os.path.exists(shp_path):
-                                                try:
-                                                    gdf = gpd.read_file(shp_path)
-                                                    # Convert to GeoJSON format
-                                                    watershed_results[key] = json.loads(
-                                                        gdf.to_json()
-                                                    )
-                                                except Exception as e:
-                                                    current_app.logger.warning(
-                                                        f"Failed to convert {filename} to GeoJSON: {str(e)}"
-                                                    )
-                                    except ImportError:
-                                        current_app.logger.warning(
-                                            "geopandas not available, cannot convert shapefiles to GeoJSON"
-                                        )
-                                    except Exception as e:
-                                        current_app.logger.warning(
-                                            f"Error converting shapefiles: {str(e)}"
-                                        )
-
-                                if watershed_results:
-                                    parsed_result["watersheds"] = watershed_results
-                                    current_app.logger.info(
-                                        f"Successfully generated {len(watershed_results)} watershed layers"
-                                    )
-                                else:
-                                    current_app.logger.warning(
-                                        "No watershed files found or converted"
-                                    )
-
-                                # Clean up temporary directory
-                                try:
-                                    shutil.rmtree(temp_output_dir)
-                                except:
-                                    pass
-                            else:
-                                error_msg = (
-                                    result.stderr or result.stdout or "Unknown error"
-                                )
+                            drn_models_dir = _resolve_drn_models_dir()
+                            if not drn_models_dir:
                                 current_app.logger.warning(
-                                    f"Watershed generation failed: {error_msg}"
+                                    "Skipping watershed generation: DRN_MODELS_DIR / input/data not found"
                                 )
-                                # Don't fail the outlet check if watershed generation fails
+                            else:
+                                cmd = [
+                                    "python3",
+                                    site_selection_script,
+                                    "--coords-file",
+                                    tmp_coords_file,
+                                    "--output-dir",
+                                    temp_output_dir,
+                                    "--script-dir",
+                                    drn_models_dir,
+                                ]
+
+                                result = subprocess.run(
+                                    cmd,
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=300,  # 5 minute timeout for watershed generation
+                                )
+
+                                if result.returncode == 0:
+                                    # Read generated shapefiles and convert to GeoJSON
+                                    watershed_results = {}
+                                    shp_dir = os.path.join(temp_output_dir, "shp")
+
+                                    if os.path.exists(shp_dir):
+                                        shapefiles = {
+                                            "sf_ws_all": "sf_ws_all.shp",
+                                            "sf_river_ode": "sf_river_ode.shp",
+                                            "sf_river_trib": "sf_river_trib.shp",
+                                            "sf_river_middle": "sf_river_middle.shp",
+                                        }
+
+                                        # Try to read sf_river_rock if it exists
+                                        rock_shp = os.path.join(
+                                            shp_dir, "sf_river_rock.shp"
+                                        )
+                                        if os.path.exists(rock_shp):
+                                            shapefiles["sf_river_rock"] = (
+                                                "sf_river_rock.shp"
+                                            )
+
+                                        # Convert shapefiles to GeoJSON using geopandas
+                                        try:
+                                            import geopandas as gpd
+
+                                            for key, filename in shapefiles.items():
+                                                shp_path = os.path.join(
+                                                    shp_dir, filename
+                                                )
+                                                if os.path.exists(shp_path):
+                                                    try:
+                                                        gdf = gpd.read_file(shp_path)
+                                                        watershed_results[key] = (
+                                                            json.loads(gdf.to_json())
+                                                        )
+                                                    except Exception as e:
+                                                        current_app.logger.warning(
+                                                            f"Failed to convert {filename} to GeoJSON: {str(e)}"
+                                                        )
+                                        except ImportError:
+                                            current_app.logger.warning(
+                                                "geopandas not available, cannot convert shapefiles to GeoJSON"
+                                            )
+                                        except Exception as e:
+                                            current_app.logger.warning(
+                                                f"Error converting shapefiles: {str(e)}"
+                                            )
+
+                                    if watershed_results:
+                                        parsed_result["watersheds"] = watershed_results
+                                        current_app.logger.info(
+                                            f"Successfully generated {len(watershed_results)} watershed layers"
+                                        )
+                                    else:
+                                        current_app.logger.warning(
+                                            "No watershed files found or converted"
+                                        )
+
+                                    try:
+                                        shutil.rmtree(temp_output_dir)
+                                    except Exception:
+                                        pass
+                                else:
+                                    error_msg = (
+                                        result.stderr
+                                        or result.stdout
+                                        or "Unknown error"
+                                    )
+                                    current_app.logger.warning(
+                                        f"Watershed generation failed: {error_msg}"
+                                    )
+                                    # Don't fail the outlet check if watershed generation fails
                         else:
                             current_app.logger.warning(
                                 "01_site_selection.py not found, skipping watershed generation"
