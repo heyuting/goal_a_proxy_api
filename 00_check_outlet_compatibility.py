@@ -76,10 +76,8 @@ def check_outlet_compatibility(coordinates, script_dir=None):
         Dictionary with 'same_outlet' (bool), 'outlet_comids' (list),
         'unique_outlets' (list), and 'results' (list of individual results)
     """
-    if len(coordinates) < 2:
-        return {
-            "error": "At least 2 coordinates are required for outlet compatibility check"
-        }
+    if len(coordinates) < 1:
+        return {"error": "At least 1 coordinate is required"}
 
     if script_dir is None:
         script_dir = Path(__file__).parent
@@ -235,10 +233,10 @@ Examples:
   # From JSON file
   python check_outlet_compatibility.py --coords-file coords.json
   
-  # Single point (will return error - need at least 2)
+  # Single point (COMID / outlet lookup)
   python check_outlet_compatibility.py --lat 37 --lon -78
   
-  # Multiple points
+  # Multiple points (same-outlet check)
   python check_outlet_compatibility.py --lat 37 --lon -78 --lat 36.5 --lon -77.5
         """,
     )

@@ -2511,10 +2511,10 @@ def check_outlet_compatibility():
         payload = request.get_json()
         coordinates = payload.get("coordinates", [])
 
-        # Validate coordinates
-        if not coordinates or not isinstance(coordinates, list) or len(coordinates) < 2:
+        # Validate coordinates (1 point = COMID lookup; 2+ = same-outlet check)
+        if not coordinates or not isinstance(coordinates, list) or len(coordinates) < 1:
             return (
-                jsonify({"error": "At least 2 coordinate pairs are required"}),
+                jsonify({"error": "At least 1 coordinate pair is required"}),
                 400,
             )
 
@@ -2624,8 +2624,12 @@ def check_outlet_compatibility():
                 if "error" in parsed_result:
                     return jsonify(parsed_result), 500
 
-                # If outlets are the same, generate watersheds locally
-                if parsed_result.get("same_outlet", False):
+                # Multi-point same-outlet: optionally generate watersheds.
+                # Skip for a single point (COMID lookup only — watershed is a separate UI action).
+                if (
+                    parsed_result.get("same_outlet", False)
+                    and len(coordinates) >= 2
+                ):
                     try:
                         # Create temporary output directory
                         import tempfile
