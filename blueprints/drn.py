@@ -2669,14 +2669,49 @@ def check_outlet_compatibility():
             # Run the script locally using subprocess
             import subprocess
 
+            # Same DRN input tree as watershed generation (DRN_MODELS_DIR)
+            drn_models_dir = _resolve_drn_models_dir(direction="downstream")
+            if not drn_models_dir:
+                env_dir = (
+                    os.getenv("DRN_MODELS_DIR") or os.getenv("DRN_R_CODE_DIR") or ""
+                ).strip()
+                detail = ""
+                if env_dir:
+                    expanded = os.path.expanduser(env_dir.strip('"').strip("'"))
+                    missing = _missing_drn_inputs(expanded, direction="downstream")
+                    detail = (
+                        f" DRN_MODELS_DIR={expanded} is missing: "
+                        + (", ".join(missing) if missing else "required input files")
+                        + "."
+                    )
+                return (
+                    jsonify(
+                        {
+                            "error": (
+                                "Could not find DRN models directory with input/shp "
+                                "for COMID/outlet lookup. Set DRN_MODELS_DIR in .env "
+                                "to the tree that contains input/data and input/shp "
+                                "(e.g. /home/yhs5/model_data/DRN/R_code)."
+                                + detail
+                            )
+                        }
+                    ),
+                    500,
+                )
+
             cmd = [
                 sys.executable,
                 "-u",
                 script_path,
                 "--coords-file",
                 tmp_coords_file,
+                "--script-dir",
+                drn_models_dir,
             ]
 
+            current_app.logger.info(
+                f"Running outlet compatibility check with DRN data at {drn_models_dir}"
+            )
             current_app.logger.debug(
                 f"Running outlet compatibility check: {' '.join(cmd)}"
             )
